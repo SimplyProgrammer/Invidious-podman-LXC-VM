@@ -1,4 +1,4 @@
-# Invidious-podman-setup
+# Invidious-podman-LXC-VM
 Simple repo for fast and automated deployment of local Invidious for Proxmox LXCs or VMs, utilizing podman.
 Inspired by https://github.com/NapoleonWils0n/cerberus/blob/master/invidious/invidious-2025.org
 
