@@ -57,28 +57,22 @@ EOF
 fi
 
 # 3) Install dependencies
-PKGS_COMMON="pwgen ca-certificates curl"
+PKGS="podman podman-compose pwgen ca-certificates curl"
 
 if need_cmd apk; then
   echo "[*] Detected Alpine (apk). Installing packages..."
   apk update
 
-  apk add --no-cache $PKGS_COMMON podman || {
-    echo "[!] Failed to install 'podman' via apk. Ensure Alpine repos include podman."
+  apk add --no-cache $PKGS iptables || {
+    echo "[!] Failed to install required packages via apk."
+    echo "    Check that your Alpine version has podman-compose in community."
     exit 1
   }
 
-  if apk info -e podman-compose >/dev/null 2>&1; then
-    apk add --no-cache podman-compose
-  else
-    echo "[*] 'podman-compose' package not found in apk repos; installing via pip..."
-    apk add --no-cache py3-pip python3
-    pip3 install --no-cache-dir --break-system-packages podman-compose
-  fi
 elif need_cmd apt-get; then
   echo "[*] Detected Debian/Ubuntu (apt-get). Installing packages..."
   apt-get update -y
-  apt-get install -y podman podman-compose $PKGS_COMMON
+  apt-get install -y $PKGS
 else
   echo "[!] No supported package manager found (need apk or apt-get). Install packages manually:"
   echo "    podman, podman-compose, pwgen, ca-certificates, curl"
@@ -160,7 +154,6 @@ EOF
   chmod +x "$OPENRC_SERVICE_PATH"
   rc-update add "$SERVICE_NAME" default
   echo "[*] Enabled OpenRC service: ${SERVICE_NAME}"
-
 else
   echo "[!] No supported init system found (systemd/OpenRC)."
   echo "    You can still run manually:"
