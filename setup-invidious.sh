@@ -56,26 +56,14 @@ ${DOMAIN} {
 EOF
 fi
 
+
 # 3) Install dependencies
-PKGS="podman podman-compose pwgen ca-certificates curl"
-
-if need_cmd apk; then
-  echo "[*] Detected Alpine (apk). Installing packages..."
-  apk update
-
-  apk add --no-cache $PKGS iptables || {
-    echo "[!] Failed to install required packages via apk."
-    echo "    Check that your Alpine version has podman-compose in community."
-    exit 1
-  }
-
-elif need_cmd apt-get; then
-  echo "[*] Detected Debian/Ubuntu (apt-get). Installing packages..."
+if need_cmd apt-get; then
+  echo "[*] Installing packages..."
   apt-get update -y
-  apt-get install -y $PKGS
+  apt-get install -y podman podman-compose pwgen git ca-certificates curl
 else
-  echo "[!] No supported package manager found (need apk or apt-get). Install packages manually:"
-  echo "    podman, podman-compose, pwgen, ca-certificates, curl"
+  echo "[!] apt-get not found. Install required packages manually."
   exit 1
 fi
 
@@ -100,14 +88,10 @@ fi
 chmod 750 start-invidious.sh stop-invidious.sh update-invidious.sh
 
 # 7) Create systemd service
-SYSTEMD_SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
-OPENRC_SERVICE_PATH="/etc/init.d/${SERVICE_NAME}"
+SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 
-if need_cmd systemctl && [ -d /run/systemd/system ]; then
-  echo "[*] Detected systemd. Writing unit file..."
-  mkdir -p /etc/systemd/system
-
-  cat > "$SYSTEMD_SERVICE_PATH" <<EOF
+echo "[*] Writing systemd service..."
+cat > "$SERVICE_PATH" <<EOF
 [Unit]
 Description=Invidious podman + Caddy
 Wants=network-online.target
@@ -125,46 +109,13 @@ TimeoutStartSec=0
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable "${SERVICE_NAME}.service"
-  echo "[*] Enabled systemd service: ${SERVICE_NAME}.service"
-
-elif [ -d /etc/init.d ] && need_cmd rc-service; then
-  echo "[*] Detected OpenRC. Writing init script..."
-
-  cat > "$OPENRC_SERVICE_PATH" <<'EOF'
-#!/sbin/openrc-run
-name="invidious podman + caddy"
-description="Invidious podman + Caddy"
-command="/bin/sh"
-command_args="-c \"${STACK_DIR}/start-invidious.sh\""
-command_stop="/bin/sh"
-command_stop_args="-c \"${STACK_DIR}/stop-invidious.sh\""
-command_background="no"
-pidfile="/run/invidious-podman-caddy.pid"
-
-depend() {
-  need net
-  after firewall
-}
-EOF
-
-  sed -i "s|\${STACK_DIR}|${STACK_DIR}|g" "$OPENRC_SERVICE_PATH"
-
-  chmod +x "$OPENRC_SERVICE_PATH"
-  rc-update add "$SERVICE_NAME" default
-  echo "[*] Enabled OpenRC service: ${SERVICE_NAME}"
-else
-  echo "[!] No supported init system found (systemd/OpenRC)."
-  echo "    You can still run manually:"
-  echo "    ${STACK_DIR}/start-invidious.sh"
-  exit 1
-fi
+systemctl daemon-reload
+systemctl enable --now "${SERVICE_NAME}.service"
 
 echo
 echo "==== Setup Complete ===="
 echo "Access via: https://<your-domain> (default: https://invidious.home.arpa)"
 echo
 echo "To trust Caddy internal CA:"
-echo "podman volume inspect caddy_data --format '{{.Mountpoint}}'"
+echo "podman volume inspect invidious-podman_caddy_data --format '{{.Mountpoint}}'"
 echo
