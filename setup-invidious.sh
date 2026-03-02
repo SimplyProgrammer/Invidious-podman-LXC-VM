@@ -106,10 +106,14 @@ fi
 chmod 750 start-invidious.sh stop-invidious.sh update-invidious.sh
 
 # 7) Create systemd service
-SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+SYSTEMD_SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+OPENRC_SERVICE_PATH="/etc/init.d/${SERVICE_NAME}"
 
-echo "[*] Writing systemd service..."
-cat > "$SERVICE_PATH" <<EOF
+if need_cmd systemctl && [ -d /run/systemd/system ]; then
+  echo "[*] Detected systemd. Writing unit file..."
+  mkdir -p /etc/systemd/system
+
+  cat > "$SYSTEMD_SERVICE_PATH" <<EOF
 [Unit]
 Description=Invidious podman + Caddy
 Wants=network-online.target
@@ -127,8 +131,42 @@ TimeoutStartSec=0
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now "${SERVICE_NAME}.service"
+  systemctl daemon-reload
+  systemctl enable "${SERVICE_NAME}.service"
+  echo "[*] Enabled systemd service: ${SERVICE_NAME}.service"
+
+elif [ -d /etc/init.d ] && need_cmd rc-service; then
+  echo "[*] Detected OpenRC. Writing init script..."
+
+  cat > "$OPENRC_SERVICE_PATH" <<'EOF'
+#!/sbin/openrc-run
+name="invidious podman + caddy"
+description="Invidious podman + Caddy"
+command="/bin/sh"
+command_args="-c \"${STACK_DIR}/start-invidious.sh\""
+command_stop="/bin/sh"
+command_stop_args="-c \"${STACK_DIR}/stop-invidious.sh\""
+command_background="no"
+pidfile="/run/invidious-podman-caddy.pid"
+
+depend() {
+  need net
+  after firewall
+}
+EOF
+
+  sed -i "s|\${STACK_DIR}|${STACK_DIR}|g" "$OPENRC_SERVICE_PATH"
+
+  chmod +x "$OPENRC_SERVICE_PATH"
+  rc-update add "$SERVICE_NAME" default
+  echo "[*] Enabled OpenRC service: ${SERVICE_NAME}"
+
+else
+  echo "[!] No supported init system found (systemd/OpenRC)."
+  echo "    You can still run manually:"
+  echo "    ${STACK_DIR}/start-invidious.sh"
+  exit 1
+fi
 
 echo
 echo "==== Setup Complete ===="
