@@ -2,20 +2,21 @@
 Simple repo for fast and automated deployment of local Invidious for Proxmox LXCs or VMs, utilizing podman.
 Inspired by https://github.com/NapoleonWils0n/cerberus/blob/master/invidious/invidious-2025.org
 
-## Installation
-Create a Debian 12+ VM or an unprivileged Debian 12+ LXC container with:
+## Setup
+### Prerequirements
+Debian 12+ VM or an unprivileged Debian 12+ LXC container with:
 * Name "invidious" (or something similar)
 * 4GB+ of RAM
 * 2+ x86_64 cores, 4 is ideal (ARM is also possible but `compose.yml` has to be modified accordingly).
 * 20+GB of storage
 * Static IP or static DHCP lease on your router.
 
-Feel free to modify the `compose.yml` file when you know what you are doing and see it as fitting. 
-
+### Networking
 Further, you will need a DNS domain, paid or local one to point to this IP of your LXC/VM with Invidious. 
 It would be great if your router would allow/do this by default, and automatically assign something like `invidious.lan` or even better, `invidious.home.arpa` to your LXC/VM. For example, [OpenWrt](https://forum.openwrt.org/t/use-home-arpa-as-default-tld-for-local-network/165056/11) does this by default. For other routers, extra config might be needed.
 If you have your own domain, reversed-proxy etc., setup might differ for you...
 
+### Installation
 Run this script (with sudo privileges or as root):
 ```
 mkdir -p ~/invidious-podman && cd "$_" && git clone "https://github.com/SimplyProgrammer/Invidious-podman-LXC-VM.git" . && chmod 755 setup-invidious.sh && ./setup-invidious.sh
@@ -28,8 +29,10 @@ If everything was done properly, now you should have a working LXC/VM with Invid
 It should automatically start with your VM/LXC, no extra work needed.
 
 # Notice
-This solution was intended for Proxmox VMs and LXC but in theory it should work with any platform that can virtualize Linux with basic networking included.
+This solution was intended for Proxmox VMs and LXC, but theoretically, it should work with any platform that can virtualize Debian with basic networking included.
+In theory, this could also work on non Debian based host OSes with slight modifications to the setup script. However, known conditions that are non-negotiable are `systemd`, virtualization + podman support, and the OS cannot be too minimalistic. For example, I have already attempted Alpine port to no avail...\
+Also, feel free to modify the `compose.yml` file when you know what you are doing and see it as fitting. 
 
-If you find this helpfull it would be great if you could start the repo and spread the word.
+If you find this helpful, it would be great if you could start the repo and spread the word.
 
 If you encounter any problem, consider opening an issue.
