@@ -44,7 +44,9 @@ else
   cat > "$CADDYFILE" <<EOF
 (ivds_site) {
   tls {
-    issuer internal
+    issuer internal {
+        lifetime 144h
+    }
   }
   reverse_proxy invidious-app:3000
   encode gzip zstd
