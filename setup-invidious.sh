@@ -32,7 +32,7 @@ fi
 if [ -f "$CADDYFILE" ]; then
   echo "[*] Caddyfile already exists."
 else
-  DFLT_DOMAIN="invidious.home.arpa"
+  DFLT_DOMAIN="$(hostname 2>/dev/null || echo 'invidious').home.arpa"
   read -rp "Enter DNS domain for HTTPS [${DFLT_DOMAIN}]: " DOMAIN
   DOMAIN="${DOMAIN:-$DFLT_DOMAIN}"
 
@@ -45,7 +45,7 @@ else
 (ivds_site) {
   tls {
     issuer internal {
-        lifetime 144h
+        lifetime 150h
     }
   }
   reverse_proxy invidious-app:3000
