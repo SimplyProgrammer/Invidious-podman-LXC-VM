@@ -1,5 +1,5 @@
 # Invidious-podman-LXC-VM
-This repo provides a simple, fast, and automated "just works" setup for running a self-hosted Invidious instance on Proxmox LXCs or VMs, utilizing podman.
+This repo provides a simple, fast, and automated "just works" setup for running a self-hosted Invidious instance on Proxmox LXCs or VMs, utilizing podman.\
 Inspired by https://github.com/NapoleonWils0n/cerberus/blob/master/invidious/invidious-2025.org
 
 ## Setup
