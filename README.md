@@ -19,7 +19,7 @@ If you have your own domain, reversed-proxy etc., setup might differ for you...
 ### Installation
 Run this script (with sudo privileges or as root):
 ```
-mkdir -p ~/invidious-podman && cd "$_" && git clone "https://github.com/SimplyProgrammer/Invidious-podman-LXC-VM.git" . && chmod 755 setup-invidious.sh && ./setup-invidious.sh
+mkdir -p ~/invidious-podman && cd "$_" && git clone --depth 1 "https://github.com/SimplyProgrammer/Invidious-podman-LXC-VM.git" . && chmod 755 setup-invidious.sh && ./setup-invidious.sh
 ```
 When it asks for the Invidious git repo, for 90% of you just press enter (unless you have your own forked one).
 
