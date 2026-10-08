@@ -60,29 +60,29 @@ fi
 # 3) Install dependencies
 inst() {
     if command -v apk >/dev/null 2>&1; then
-        $SUDO apk update
-        $SUDO apk add "$@"
+        apk update
+        apk add "$@"
     elif command -v apt-get >/dev/null 2>&1; then
-        $SUDO apt-get update
-        $SUDO apt-get install -y "$@"
+        apt-get update
+        apt-get install -y "$@"
     elif command -v apt >/dev/null 2>&1; then
-        $SUDO apt update
-        $SUDO apt install -y "$@"
+        apt update
+        apt install -y "$@"
     elif command -v dnf >/dev/null 2>&1; then
-        $SUDO dnf install -y "$@"
+        dnf install -y "$@"
     elif command -v yum >/dev/null 2>&1; then
-        $SUDO yum install -y "$@"
+        yum install -y "$@"
     elif command -v pacman >/dev/null 2>&1; then
-        $SUDO pacman -Sy --noconfirm "$@"
+        pacman -Sy --noconfirm "$@"
     elif command -v zypper >/dev/null 2>&1; then
-        $SUDO zypper --non-interactive install "$@"
+        zypper --non-interactive install "$@"
     elif command -v xbps-install >/dev/null 2>&1; then
-        $SUDO xbps-install -Sy "$@"
+        xbps-install -Sy "$@"
     elif command -v emerge >/dev/null 2>&1; then
-        $SUDO emerge "$@"
+        emerge "$@"
     elif command -v opkg >/dev/null 2>&1; then
-        $SUDO opkg update
-        $SUDO opkg install "$@"
+        opkg update
+        opkg install "$@"
     else
         echo "Unsupported package manager."
         exit 1
