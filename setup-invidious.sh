@@ -6,9 +6,7 @@ SERVICE_NAME="invidious"
 DEFAULT_REPO="https://github.com/iv-org/invidious.git"
 CADDYFILE="${STACK_DIR}/Caddyfile"
 
-need_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-echo "==== Invidious Setup + Caddy internal TLS) ===="
+echo "==== Invidious Setup + Caddy internal TLS ===="
 
 cd "$STACK_DIR" || {
   echo "[!] Stack dir not found: $STACK_DIR"
@@ -25,7 +23,7 @@ if [ -d "invidious" ]; then
   echo "[*] 'invidious' directory already exists, skipping clone."
 else
   echo "[*] Cloning repository..."
-  git clone "$REPO_URL" invidious
+  git clone --depth 1  "$REPO_URL" invidious
 fi
 
 # 2) Ask for DNS and gen Caddyfile
@@ -60,14 +58,38 @@ fi
 
 
 # 3) Install dependencies
-if need_cmd apt-get; then
-  echo "[*] Installing packages..."
-  apt-get update -y
-  apt-get install -y podman podman-compose pwgen git ca-certificates curl
-else
-  echo "[!] apt-get not found. Install required packages manually."
-  exit 1
-fi
+inst() {
+    if command -v apk >/dev/null 2>&1; then
+        $SUDO apk update
+        $SUDO apk add "$@"
+    elif command -v apt-get >/dev/null 2>&1; then
+        $SUDO apt-get update
+        $SUDO apt-get install -y "$@"
+    elif command -v apt >/dev/null 2>&1; then
+        $SUDO apt update
+        $SUDO apt install -y "$@"
+    elif command -v dnf >/dev/null 2>&1; then
+        $SUDO dnf install -y "$@"
+    elif command -v yum >/dev/null 2>&1; then
+        $SUDO yum install -y "$@"
+    elif command -v pacman >/dev/null 2>&1; then
+        $SUDO pacman -Sy --noconfirm "$@"
+    elif command -v zypper >/dev/null 2>&1; then
+        $SUDO zypper --non-interactive install "$@"
+    elif command -v xbps-install >/dev/null 2>&1; then
+        $SUDO xbps-install -Sy "$@"
+    elif command -v emerge >/dev/null 2>&1; then
+        $SUDO emerge "$@"
+    elif command -v opkg >/dev/null 2>&1; then
+        $SUDO opkg update
+        $SUDO opkg install "$@"
+    else
+        echo "Unsupported package manager."
+        exit 1
+    fi
+}
+
+inst podman podman-compose pwgen git ca-certificates curl
 
 # 4) Create .env if missing
 ENV_FILE="${STACK_DIR}/.env"
