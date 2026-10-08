@@ -7,6 +7,9 @@ read -r -p "Do you want to update, backing up current installation is recommende
 response=$(printf '%s' "$response" | tr '[:upper:]' '[:lower:]')
 
 if [ "$response" = "y" ] || [ "$response" = "yes" ]; then
+    ./stop-invidious.sh
+
+    git -C ./invidious pull
     podman-compose pull
     podman-compose up -d
     podman image prune -f
