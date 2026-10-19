@@ -18,7 +18,7 @@ If you have your own domain, reversed-proxy etc., setup might differ for you...
 
 ### Installation
 Run this script (with sudo privileges or as root):
-```
+```sh
 mkdir -p ~/invidious-podman && cd "$_" && git clone --depth 1 "https://github.com/SimplyProgrammer/Invidious-podman-LXC-VM.git" . && chmod 755 setup-invidious.sh && ./setup-invidious.sh
 ```
 When it asks for the Invidious git repo, for 90% of you just press enter (unless you have your own forked one).
@@ -27,6 +27,13 @@ The most important part, when it asks for the DNS domain, specify aforementioned
 
 If everything was done properly, now you should have a working LXC/VM with Invidious service and should be able to open it at `https://<your-invidious-domain>/`.\
 It should automatically start with your VM/LXC, no extra work needed.
+
+Note:
+It is not recommended to run this non stop without restarts or disabling it. It is recommended to use this:
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/SimplyProgrammer/Proxmox-LXC-start-stop-scheduler/main/lxc-schedule.sh)
+```
+Specify the container and select times to stop and start Invidious container. For uninterrupted use, late night hour and early morning one is recommended for stop and start respectively.
 
 # Notice
 This solution was intended for Proxmox VMs and LXC, but theoretically, it should work with any platform that can virtualize Debian with basic networking included.
