@@ -41,22 +41,54 @@ else
 
   cat > "$CADDYFILE" <<EOF
 {
+    #debug
+
+    auto_https disable_redirects
+
     pki {
         ca local {
             name "Local Invidious CA"
             root_cn "Local Invidious Root CA"
             intermediate_cn "Local Invidious Intermediate CA"
+            intermediate_lifetime 120d
         }
     }
 }
 
+:80 {
+    header {
+        -Server
+        -Via
+    }
+
+    redir https://${DOMAIN}{uri} 308
+}
+
+:443 {
+    header {
+        -Server
+        -Via
+    }
+
+    respond "Not Found" 404
+}
+
 (ivds_site) {
-  reverse_proxy invidious-app:3000
-  encode gzip zstd
+    reverse_proxy invidious-app:3000 {
+        header_down -Server
+        header_down -Via
+    }
+
+    encode gzip zstd
+
+    header {
+        -Server
+        -Via
+    }
 }
 
 ${DOMAIN} {
-  import ivds_site
+    import ivds_site
 }
 EOF
 fi

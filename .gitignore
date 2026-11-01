@@ -1,4 +1,7 @@
 .env
+*.dbg.py
+*.dbg.sh
+
 Caddyfile
 
 /invidious

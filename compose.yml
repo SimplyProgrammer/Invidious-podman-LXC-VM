@@ -92,7 +92,10 @@ services:
       - ivnet
 
   caddy:
-    image: docker.io/caddy:latest
+    image: localhost/caddy-varc:latest
+    build:
+      context: ./caddy
+      dockerfile: Containerfile
     restart: unless-stopped
     ports:
       - "80:80"
@@ -101,6 +104,7 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+      - caddy_cache:/var/cache/caddy
     depends_on:
       - invidious
     networks:
@@ -111,6 +115,7 @@ volumes:
   companioncache:
   caddy_data:
   caddy_config:
+  caddy_cache:
 
 networks:
   ivnet:
