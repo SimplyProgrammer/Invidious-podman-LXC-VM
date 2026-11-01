@@ -40,12 +40,17 @@ else
   echo "[*] Writing Caddyfile for: ${DOMAIN}"
 
   cat > "$CADDYFILE" <<EOF
-(ivds_site) {
-  tls {
-    issuer internal {
-        lifetime 150h
+{
+    pki {
+        ca local {
+            name "Local Invidious CA"
+            root_cn "Local Invidious Root CA"
+            intermediate_cn "Local Invidious Intermediate CA"
+        }
     }
-  }
+}
+
+(ivds_site) {
   reverse_proxy invidious-app:3000
   encode gzip zstd
 }
