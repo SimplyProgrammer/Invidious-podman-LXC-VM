@@ -37,25 +37,94 @@ else
   DOMAIN="${DOMAIN#http://}"
   DOMAIN="${DOMAIN#https://}"
 
+  # Intermediate CA lifetime in the global pki block (120d) expressed in hours
+  INTERMEDIATE_HOURS=$((120 * 24))
+
+  read -rp "Cert expire time in hours [0]: " CERT_HOURS
+  CERT_HOURS="${CERT_HOURS:-0}"
+
+  if ! [[ "$CERT_HOURS" =~ ^[0-9]+$ ]]; then
+    echo "[!] Cert expire time must be a non-negative integer."
+    exit 1
+  fi
+
+  # Force base 10 (avoids "08" being treated as octal)
+  CERT_HOURS=$((10#$CERT_HOURS))
+
+  if [ "$CERT_HOURS" -ge "$INTERMEDIATE_HOURS" ]; then
+    echo "[!] Cert lifetime must be shorter than the intermediate CA lifetime (${INTERMEDIATE_HOURS}h)."
+    exit 1
+  fi
+
+  # Optional tls block (only if HOURS > 0). Note: the trailing blank line
+  # inside the quotes is intentional so reverse_proxy lands on its own line.
+  TLS_BLOCK=""
+  if [ "$CERT_HOURS" -gt 0 ]; then
+    TLS_BLOCK="    tls {
+        issuer internal {
+            ca local
+            lifetime ${CERT_HOURS}h
+        }
+    }
+
+"
+  fi
+
   echo "[*] Writing Caddyfile for: ${DOMAIN}"
 
   cat > "$CADDYFILE" <<EOF
-(ivds_site) {
-  tls {
-    issuer internal {
-        lifetime 150h
+{
+    #debug
+
+    auto_https disable_redirects
+
+    pki {
+        ca local {
+            name "Local Invidious CA"
+            root_cn "Local Invidious Root CA"
+            intermediate_cn "Local Invidious Intermediate CA"
+            intermediate_lifetime 120d
+        }
     }
-  }
-  reverse_proxy invidious-app:3000
-  encode gzip zstd
+}
+
+:80 {
+    header {
+        -Server
+        -Via
+    }
+
+    redir https://${DOMAIN}{uri} 308
+}
+
+:443 {
+    header {
+        -Server
+        -Via
+    }
+
+    respond "Not Found" 404
+}
+
+(ivds_site) {
+${TLS_BLOCK}    reverse_proxy invidious-app:3000 {
+        header_down -Server
+        header_down -Via
+    }
+
+    encode gzip zstd
+
+    header {
+        -Server
+        -Via
+    }
 }
 
 ${DOMAIN} {
-  import ivds_site
+    import ivds_site
 }
 EOF
 fi
-
 
 # 3) Install dependencies
 inst() {
