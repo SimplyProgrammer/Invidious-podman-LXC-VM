@@ -106,11 +106,23 @@ services:
     networks:
       - ivnet
 
+  nginx-cache:
+    image: docker.io/library/nginx:stable
+    restart: unless-stopped
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - nginx_cache:/var/cache/nginx
+    depends_on:
+      - invidious
+    networks:
+      - ivnet
+
 volumes:
   postgresdata:
   companioncache:
   caddy_data:
   caddy_config:
+  nginx_cache:
 
 networks:
   ivnet:
