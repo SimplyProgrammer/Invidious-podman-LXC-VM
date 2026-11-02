@@ -35,6 +35,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/SimplyProgrammer/Proxmox-LXC
 ```
 Specify the container and select times to stop and start Invidious container. For uninterrupted use, late night hour and early morning one is recommended for stop and start respectively.
 
+#### Other usefull commands
+Show active config:
+```sh
+podman-compose config
+```
+
+Create script to reload Caddyfile "in flight":
+```sh
+echo "podman exec invidious-podman_caddy_1 caddy reload --config /etc/caddy/Caddyfile" > refresh-caddyfile.dbg.sh
+```
+
 # Notice
 This solution was intended for Proxmox VMs and LXC, but theoretically, it should work with any platform that can virtualize Debian with basic networking included.
 In theory, this could also work on non Debian based host OSes with slight modifications to the setup script. However, known conditions that are non-negotiable are `systemd`, virtualization + podman support, and the OS cannot be too minimalistic. For example, I have already attempted Alpine port to no avail...\
