@@ -1,0 +1,63 @@
+@adaptive_paths path /companion/videoplayback* /_adaptive/status
+
+handle @adaptive_paths {
+    adaptive_proxy {
+        selection adaptive_weighted_random
+
+        latency_threshold 6s
+        latency_penalty 1
+        error_penalty 2
+
+        recovery_interval 30m
+        recovery_amount 1
+
+        max_attempts 3
+
+        header_up -Via
+        header_up -Forwarded
+        header_up -X-Forwarded-*
+        header_up -X-Real-IP
+        header_down -Server
+        header_down -Via
+
+        backend local http://invidious-app:3000 {
+            penalty 0
+        }
+
+        backend nadeko-us1 https://inv-us1.nadeko.net {
+            penalty 0
+        }
+
+        backend nadeko-cl2 https://inv-cl2.nadeko.net {
+            penalty 0
+        }
+
+        backend cho-comp2 https://yt-comp2.chocolatemoo53.com {
+            penalty 0
+        }
+
+        backend cho-comp4 https://eu.yt-comp4.chocolatemoo53.com {
+            penalty 0
+        }
+
+        backend nerdvpn https://invidious.nerdvpn.de {
+            penalty 0
+        }
+        
+        backend nadeko-de2 https://inv-de2.nadeko.net {
+            penalty 0
+        }
+
+        circuit_breaker {
+            enabled true
+            failure_threshold 3
+            cooldown 80s
+        }
+
+        statistics {
+            enabled true
+            path /_adaptive/status
+            allowed_ips 127.0.0.1
+        }
+    }
+}

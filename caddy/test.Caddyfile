@@ -1,0 +1,50 @@
+{
+    auto_https off
+}
+
+:8080 {
+    handle /companion/videoplayback* {
+        adaptive_playback {
+            selection adaptive_weighted_random
+
+            latency_threshold 6s
+            latency_penalty 1
+            error_penalty 2
+
+            recovery_interval 5m
+            recovery_amount 1
+
+            max_attempts 3
+
+            backend local http://invidious-app:3000 {
+                penalty 0
+            }
+
+            backend nadeko-us1 https://inv-us1.nadeko.net {
+                penalty 1
+            }
+
+            backend nadeko-cl2 https://inv-cl2.nadeko.net {
+                penalty 1
+            }
+
+            backend nadeko-de1 https://inv-de1.nadeko.net {
+                penalty 1
+            }
+
+            backend nadeko-de2 https://inv-de2.nadeko.net {
+                penalty 1
+            }
+
+            backend nerdvpn https://invidious.nerdvpn.de {
+                penalty 1
+            }
+
+            statistics {
+                enabled true
+                path /_adaptive/status
+                allowed_ips 127.0.0.1 ::1
+            }
+        }
+    }
+}

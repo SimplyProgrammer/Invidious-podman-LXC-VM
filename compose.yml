@@ -96,13 +96,16 @@ services:
       - ivnet
 
   caddy:
-    image: docker.io/caddy:latest
+    build:
+      context: ./caddy
+      dockerfile: Dockerfile
+    image: localhost/caddy-adaptive:2.11.7
     restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy-config:/etc/caddy:ro,Z
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
