@@ -8,211 +8,212 @@ import (
 
 const recentDurationLimit = 20
 
-// BackendMetrics is a point-in-time metrics snapshot for one backend. Penalty
-// and weight are joined from BackendPool when the status endpoint is rendered.
+// BackendMetrics is a point-in-time metrics snapshot for one backend.
 type BackendMetrics struct {
-	Name                   string    `json:"name"`
-	URL                    string    `json:"url"`
-	Requests               uint64    `json:"requests"`
-	Successes              uint64    `json:"successes"`
-	Failures               uint64    `json:"failures"`
-	Retries                uint64    `json:"retries"`
-	SlowResponses          uint64    `json:"slow_responses"`
-	BytesTransferred       uint64    `json:"bytes_transferred"`
-	AverageDuration        string    `json:"average_duration"`
-	RecentAverageDuration  string    `json:"recent_average_duration"`
-	LastDuration           string    `json:"last_duration"`
-	LastBytes              uint64    `json:"last_bytes"`
-	LastThroughputBytesSec float64   `json:"last_throughput_bytes_sec"`
-	LastSuccess            time.Time `json:"last_success,omitempty"`
-	LastFailure            time.Time `json:"last_failure,omitempty"`
+	Name                      string    `json:"name"`
+	URL                       string    `json:"url"`
+	Requests                  uint64    `json:"requests"`
+	Successes                 uint64    `json:"successes"`
+	Failures                  uint64    `json:"failures"`
+	Retries                   uint64    `json:"retries"`
+	ClientCancellations       uint64    `json:"client_cancellations"`
+	SlowResponses             uint64    `json:"slow_responses"`
+	BytesTransferred          uint64    `json:"bytes_transferred"`
+	AverageDuration           string    `json:"average_duration"`
+	RecentAverageDuration     string    `json:"recent_average_duration"`
+	LastDuration              string    `json:"last_duration"`
+	LastBytes                 uint64    `json:"last_bytes"`
+	LastThroughputBytesSec    float64   `json:"last_throughput_bytes_sec"`
+	AverageTTFB               string    `json:"average_ttfb"`
+	RecentAverageTTFB         string    `json:"recent_average_ttfb"`
+	LastTTFB                  string    `json:"last_ttfb"`
+	LastTransferDuration      string    `json:"last_transfer_duration"`
+	AverageThroughputBytesSec float64   `json:"average_throughput_bytes_sec"`
+	LastSuccess               time.Time `json:"last_success,omitempty"`
+	LastFailure               time.Time `json:"last_failure,omitempty"`
 }
 
 type backendMetricState struct {
-	name             string
-	url              string
-	requests         uint64
-	completed        uint64
-	successes        uint64
-	failures         uint64
-	retries          uint64
-	slowResponses    uint64
-	bytesTransferred uint64
-	totalDuration    time.Duration
-	recentDurations  []time.Duration
-	lastDuration     time.Duration
-	lastBytes        uint64
-	lastThroughput   float64
-	lastSuccess      time.Time
-	lastFailure      time.Time
+	name, url                                                                                         string
+	requests, completed, successes, failures, retries, cancellations, slowResponses, bytesTransferred uint64
+	totalDuration, totalTTFB, totalTransfer                                                           time.Duration
+	ttfbSamples                                                                                       uint64
+	recentDurations, recentTTFB                                                                       []time.Duration
+	lastDuration, lastTTFB, lastTransfer                                                              time.Duration
+	lastBytes                                                                                         uint64
+	lastThroughput                                                                                    float64
+	lastSuccess, lastFailure                                                                          time.Time
 }
 
-// MetricsCollector is safe for concurrent request handlers.
+// MetricsCollector is safe for concurrent request handlers. Logical request
+// outcomes and upstream-attempt metrics are deliberately tracked separately.
 type MetricsCollector struct {
-	mu                  sync.RWMutex
-	backends            map[string]*backendMetricState
-	requests            uint64
-	attempts            uint64
-	retries             uint64
-	exhausted           uint64
-	slow                uint64
-	bytes               uint64
-	accumulatedDuration time.Duration
+	mu                                                  sync.RWMutex
+	backends                                            map[string]*backendMetricState
+	requests, attempts, retries, exhausted, slow, bytes uint64
+	active                                              uint64
+	outcomes                                            map[string]uint64
+	accumulatedDuration                                 time.Duration
 }
 
 func newMetricsCollector(backends []BackendConfig) *MetricsCollector {
-	m := &MetricsCollector{backends: make(map[string]*backendMetricState, len(backends))}
-	for _, backend := range backends {
-		m.backends[backend.Name] = &backendMetricState{
-			name: backend.Name,
-			url:  backend.URL,
-		}
+	m := &MetricsCollector{backends: make(map[string]*backendMetricState, len(backends)), outcomes: make(map[string]uint64)}
+	for _, b := range backends {
+		m.backends[b.Name] = &backendMetricState{name: b.Name, url: b.URL}
 	}
 	return m
 }
-
 func (m *MetricsCollector) recordRequest() {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
 	m.requests++
+	m.active++
 	m.mu.Unlock()
 }
-
-func (m *MetricsCollector) recordExhausted() {
-	if m == nil {
+func (m *MetricsCollector) recordOutcome(outcome string) {
+	if m == nil || outcome == "" {
 		return
 	}
 	m.mu.Lock()
-	m.exhausted++
+	m.outcomes[outcome]++
+	if m.active > 0 {
+		m.active--
+	}
+	if outcome == "exhausted_retries" {
+		m.exhausted++
+	}
 	m.mu.Unlock()
 }
-
 func (m *MetricsCollector) recordAttempt(name string) {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if backend := m.backends[name]; backend != nil {
-		backend.requests++
+	if b := m.backends[name]; b != nil {
+		b.requests++
 		m.attempts++
 	}
+	m.mu.Unlock()
 }
-
+func (m *MetricsCollector) recordCancellation(name string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if b := m.backends[name]; b != nil {
+		b.cancellations++
+	}
+	m.mu.Unlock()
+}
 func (m *MetricsCollector) recordRetry(name string) {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if backend := m.backends[name]; backend != nil {
-		backend.retries++
+	if b := m.backends[name]; b != nil {
+		b.retries++
 		m.retries++
 	}
+	m.mu.Unlock()
 }
-
 func (m *MetricsCollector) recordSuccess(name string, duration time.Duration, bytes uint64, slow bool) {
-	m.recordCompletion(name, duration, bytes, slow, true)
+	m.recordCompletion(name, duration, 0, 0, bytes, slow, true)
 }
-
 func (m *MetricsCollector) recordFailure(name string, duration time.Duration, bytes uint64, slow bool) {
-	m.recordCompletion(name, duration, bytes, slow, false)
+	m.recordCompletion(name, duration, 0, 0, bytes, slow, false)
 }
-
-func (m *MetricsCollector) recordCompletion(name string, duration time.Duration, bytes uint64, slow, success bool) {
+func (m *MetricsCollector) recordCompletion(name string, duration, ttfb, transfer time.Duration, bytes uint64, slow, success bool) {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	backend := m.backends[name]
-	if backend == nil {
+	b := m.backends[name]
+	if b == nil {
 		return
 	}
 	now := time.Now().UTC()
-	backend.completed++
+	b.completed++
 	if success {
-		backend.successes++
-		backend.lastSuccess = now
+		b.successes++
+		b.lastSuccess = now
 	} else {
-		backend.failures++
-		backend.lastFailure = now
+		b.failures++
+		b.lastFailure = now
 	}
 	if slow {
-		backend.slowResponses++
+		b.slowResponses++
 		m.slow++
 	}
-	backend.bytesTransferred += bytes
+	b.bytesTransferred += bytes
 	m.bytes += bytes
-	backend.totalDuration += duration
-	m.accumulatedDuration += duration
-	backend.lastDuration = duration
-	backend.lastBytes = bytes
-	if duration > 0 {
-		backend.lastThroughput = float64(bytes) / duration.Seconds()
-	} else {
-		backend.lastThroughput = 0
+	b.totalDuration += duration
+	if ttfb > 0 {
+		b.totalTTFB += ttfb
+		b.ttfbSamples++
 	}
-	backend.recentDurations = append(backend.recentDurations, duration)
-	if len(backend.recentDurations) > recentDurationLimit {
-		backend.recentDurations = append([]time.Duration(nil), backend.recentDurations[len(backend.recentDurations)-recentDurationLimit:]...)
+	b.totalTransfer += transfer
+	m.accumulatedDuration += transfer
+	b.lastDuration = duration
+	b.lastTTFB = ttfb
+	b.lastTransfer = transfer
+	b.lastBytes = bytes
+	if transfer > 0 {
+		b.lastThroughput = float64(bytes) / transfer.Seconds()
+	} else {
+		b.lastThroughput = 0
+	}
+	b.recentDurations = append(b.recentDurations, duration)
+	if len(b.recentDurations) > recentDurationLimit {
+		b.recentDurations = append([]time.Duration(nil), b.recentDurations[len(b.recentDurations)-recentDurationLimit:]...)
+	}
+	if ttfb > 0 {
+		b.recentTTFB = append(b.recentTTFB, ttfb)
+	}
+	if len(b.recentTTFB) > recentDurationLimit {
+		b.recentTTFB = append([]time.Duration(nil), b.recentTTFB[len(b.recentTTFB)-recentDurationLimit:]...)
 	}
 }
-
-// Snapshot returns immutable copies for rendering or diagnostics.
+func avgDuration(ds []time.Duration) time.Duration {
+	var total time.Duration
+	for _, d := range ds {
+		total += d
+	}
+	if len(ds) == 0 {
+		return 0
+	}
+	return total / time.Duration(len(ds))
+}
 func (m *MetricsCollector) Snapshot() ([]BackendMetrics, map[string]uint64) {
 	if m == nil {
 		return nil, map[string]uint64{}
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
-	backends := make([]BackendMetrics, 0, len(m.backends))
-	for _, state := range m.backends {
-		var average, recentAverage time.Duration
-		if state.completed > 0 {
-			average = state.totalDuration / time.Duration(state.completed)
+	out := make([]BackendMetrics, 0, len(m.backends))
+	for _, b := range m.backends {
+		var avg, avgTTFB time.Duration
+		if b.completed > 0 {
+			avg = b.totalDuration / time.Duration(b.completed)
 		}
-		if len(state.recentDurations) > 0 {
-			var total time.Duration
-			for _, duration := range state.recentDurations {
-				total += duration
-			}
-			recentAverage = total / time.Duration(len(state.recentDurations))
+		if b.ttfbSamples > 0 {
+			avgTTFB = b.totalTTFB / time.Duration(b.ttfbSamples)
 		}
-		backends = append(backends, BackendMetrics{
-			Name:                   state.name,
-			URL:                    state.url,
-			Requests:               state.requests,
-			Successes:              state.successes,
-			Failures:               state.failures,
-			Retries:                state.retries,
-			SlowResponses:          state.slowResponses,
-			BytesTransferred:       state.bytesTransferred,
-			AverageDuration:        average.String(),
-			RecentAverageDuration:  recentAverage.String(),
-			LastDuration:           state.lastDuration.String(),
-			LastBytes:              state.lastBytes,
-			LastThroughputBytesSec: state.lastThroughput,
-			LastSuccess:            state.lastSuccess,
-			LastFailure:            state.lastFailure,
-		})
+		throughput := float64(0)
+		if b.totalTransfer > 0 {
+			throughput = float64(b.bytesTransferred) / b.totalTransfer.Seconds()
+		}
+		out = append(out, BackendMetrics{Name: b.name, URL: b.url, Requests: b.requests, Successes: b.successes, Failures: b.failures, Retries: b.retries, ClientCancellations: b.cancellations, SlowResponses: b.slowResponses, BytesTransferred: b.bytesTransferred, AverageDuration: avg.String(), RecentAverageDuration: avgDuration(b.recentDurations).String(), LastDuration: b.lastDuration.String(), LastBytes: b.lastBytes, LastThroughputBytesSec: b.lastThroughput, AverageTTFB: avgTTFB.String(), RecentAverageTTFB: avgDuration(b.recentTTFB).String(), LastTTFB: b.lastTTFB.String(), LastTransferDuration: b.lastTransfer.String(), AverageThroughputBytesSec: throughput, LastSuccess: b.lastSuccess, LastFailure: b.lastFailure})
 	}
-	sort.Slice(backends, func(i, j int) bool { return backends[i].Name < backends[j].Name })
-	global := map[string]uint64{
-		"requests":           m.requests,
-		"attempts":           m.attempts,
-		"retries":            m.retries,
-		"exhausted_requests": m.exhausted,
-		"slow":               m.slow,
-		"bytes":              m.bytes,
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	g := map[string]uint64{"requests": m.requests, "attempts": m.attempts, "retries": m.retries, "exhausted_requests": m.exhausted, "slow": m.slow, "bytes": m.bytes, "in_progress": m.active}
+	for k, v := range m.outcomes {
+		g["outcome_"+k] = v
 	}
-	return backends, global
+	return out, g
 }
-
-// totalDuration returns the accumulated duration of completed upstream bodies.
 func (m *MetricsCollector) totalDuration() time.Duration {
 	if m == nil {
 		return 0

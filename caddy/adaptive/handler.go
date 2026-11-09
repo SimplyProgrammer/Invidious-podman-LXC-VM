@@ -34,12 +34,12 @@ func init() {
 type Handler struct {
 	Selection        string                `json:"selection,omitempty"`
 	LatencyThreshold caddy.Duration        `json:"latency_threshold,omitempty"`
-	LatencyPenalty   *int                  `json:"latency_penalty,omitempty"`
-	ErrorPenalty     *int                  `json:"error_penalty,omitempty"`
+	LatencyPenalty   *LatencyPenaltyConfig `json:"latency_penalty,omitempty"`
+	ErrorPenalty     *float64              `json:"error_penalty,omitempty"`
 	RecoveryInterval caddy.Duration        `json:"recovery_interval,omitempty"`
-	RecoveryAmount   *int                  `json:"recovery_amount,omitempty"`
+	RecoveryAmount   *float64              `json:"recovery_amount,omitempty"`
 	MaxAttempts      *int                  `json:"max_attempts,omitempty"`
-	MaxPenalty       *int                  `json:"max_penalty,omitempty"`
+	MaxPenalty       *float64              `json:"max_penalty,omitempty"`
 	RetryStatusCodes []int                 `json:"retry_status_codes,omitempty"`
 	Headers          *caddyheaders.Handler `json:"headers,omitempty"`
 	Backends         []BackendConfig       `json:"backends,omitempty"`
@@ -124,6 +124,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 		return nil
 	}
 	h.metrics.recordRequest()
+	outcome := ""
+	defer func() { h.metrics.recordOutcome(outcome) }()
 
 	maxAttempts := *h.MaxAttempts
 	if maxAttempts > len(h.Backends) {
@@ -137,9 +139,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 
 	excluded := make(map[string]struct{}, maxAttempts)
 	var lastErr error
+	attemptsMade := 0
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if r.Context().Err() != nil {
+			outcome = "client_cancellation"
 			return nil
 		}
 
@@ -158,6 +162,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 		}
 		excluded[backend.Name] = struct{}{}
 		h.metrics.recordAttempt(backend.Name)
+		attemptsMade++
 
 		outReq, err := h.outboundRequest(r, backend, attempt > 0)
 		if err != nil {
@@ -173,6 +178,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 		resp, roundTripErr := http.DefaultTransport.RoundTrip(outReq)
 		if roundTripErr != nil {
 			if r.Context().Err() != nil || isClientCancellation(roundTripErr) {
+				h.metrics.recordCancellation(backend.Name)
+				outcome = "client_cancellation"
 				return nil
 			}
 			lastErr = roundTripErr
@@ -192,9 +199,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 			continue
 		}
 
+		responseReceived := time.Now()
+		ttfb := responseReceived.Sub(started)
 		if h.shouldRetryStatus(resp.StatusCode) && attempt+1 < maxAttempts {
 			lastErr = fmt.Errorf("upstream %s returned retryable HTTP status %d", backend.Name, resp.StatusCode)
-			h.recordBackendFailure(backend.Name, time.Since(started), 0, false)
+			h.penalize(backend.Name, *h.ErrorPenalty)
+			h.metrics.recordCompletion(backend.Name, ttfb, ttfb, 0, 0, false, false)
+			if h.breaker != nil {
+				h.breaker.RecordFailure(backend.Name, time.Now())
+			}
 			h.metrics.recordRetry(backend.Name)
 			closeAndDrain(resp.Body)
 			continue
@@ -218,6 +231,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 		trackedWriter := &responseWriteTracker{ResponseWriter: w}
 		bytesWritten, copyErr := io.Copy(trackedWriter, resp.Body)
 		_ = resp.Body.Close()
+		transferDuration := time.Since(responseReceived)
 		duration := time.Since(started)
 
 		if copyErr != nil {
@@ -225,39 +239,62 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 			// corrupt the response. A downstream write failure/client disconnect
 			// is not evidence that the selected upstream is unhealthy.
 			if trackedWriter.writeErr == nil && r.Context().Err() == nil && !isClientCancellation(copyErr) {
-				h.recordBackendFailure(backend.Name, duration, uint64(bytesWritten), false)
+				h.penalize(backend.Name, *h.ErrorPenalty)
+				h.metrics.recordCompletion(backend.Name, duration, ttfb, transferDuration, uint64(bytesWritten), false, false)
+				if h.breaker != nil {
+					h.breaker.RecordFailure(backend.Name, time.Now())
+				}
+				outcome = "interrupted_transfer"
 				return fmt.Errorf("streaming response from backend %q: %w", backend.Name, copyErr)
 			}
+			h.metrics.recordCancellation(backend.Name)
+			outcome = "client_cancellation"
 			return nil
 		}
 
 		slow := duration > time.Duration(h.LatencyThreshold)
 		if slow {
-			h.penalize(backend.Name, *h.LatencyPenalty)
+			latencyPenalty := h.LatencyPenalty.Value
+			if h.LatencyPenalty.Proportional {
+				latencyPenalty *= float64(duration) / float64(time.Duration(h.LatencyThreshold))
+			}
+			h.penalize(backend.Name, latencyPenalty)
 		}
 		if statusFailure {
 			// The response was delivered, but its status is still a configured
 			// backend failure.
-			h.metrics.recordFailure(backend.Name, duration, uint64(bytesWritten), slow)
+			h.metrics.recordCompletion(backend.Name, duration, ttfb, transferDuration, uint64(bytesWritten), slow, false)
 			if h.breaker != nil {
 				h.breaker.RecordFailure(backend.Name, time.Now())
 			}
 		} else {
-			h.metrics.recordSuccess(backend.Name, duration, uint64(bytesWritten), slow)
+			h.metrics.recordCompletion(backend.Name, duration, ttfb, transferDuration, uint64(bytesWritten), slow, true)
 			if h.breaker != nil {
 				h.breaker.RecordSuccess(backend.Name)
 			}
+		}
+		if statusFailure {
+			outcome = "upstream_http_error"
+		} else if resp.StatusCode >= 400 {
+			outcome = "non_retryable_response"
+		} else {
+			outcome = "completed_successfully"
 		}
 		return nil
 	}
 
 	if r.Context().Err() != nil {
+		outcome = "client_cancellation"
 		return nil
 	}
 	if lastErr == nil {
 		lastErr = ErrNoEligibleBackend
 	}
-	h.metrics.recordExhausted()
+	if attemptsMade == 1 && lastErr != nil && !errors.Is(lastErr, ErrNoEligibleBackend) {
+		outcome = "upstream_connection_error"
+	} else {
+		outcome = "exhausted_retries"
+	}
 	http.Error(w, "all proxy backends failed", http.StatusBadGateway)
 	return nil
 }
@@ -434,7 +471,7 @@ func (h *Handler) shouldRetryStatus(code int) bool {
 	return ok
 }
 
-func (h *Handler) penalize(name string, amount int) {
+func (h *Handler) penalize(name string, amount float64) {
 	if amount > 0 && h.pool != nil {
 		_ = h.pool.AddPenalty(name, amount)
 	}

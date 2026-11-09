@@ -46,6 +46,16 @@ Create script to reload Caddyfile "in flight":
 echo "podman exec invidious-podman_caddy_1 caddy reload --config /etc/caddy/Caddyfile" > refresh-caddyfile.dbg.sh
 ```
 
+Print running caddy config:
+```sh
+podman exec "$(podman ps -q --filter name=caddy | head -n1)" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile --pretty
+```
+
+Show caddy adaptive_proxy `/_adaptive/status` when enabled (need format):
+```sh
+podman exec "$(podman ps -q --filter name=caddy | head -n1)" curl -sk --resolve ivds.home.arpa:443:127.0.0.1 https://ivds.home.arpa/_adaptive/status
+```
+
 # Notice
 This solution was intended for Proxmox VMs and LXC, but theoretically, it should work with any platform that can virtualize Debian with basic networking included.
 In theory, this could also work on non Debian based host OSes with slight modifications to the setup script. However, known conditions that are non-negotiable are `systemd`, virtualization + podman support, and the OS cannot be too minimalistic. For example, I have already attempted Alpine port to no avail...\

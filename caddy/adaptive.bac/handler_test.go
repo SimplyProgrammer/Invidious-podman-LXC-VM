@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	caddyheaders "github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
 )
 
 func newTestHandler(t *testing.T, backends []BackendConfig, attempts int, retryCodes []int) *Handler {
@@ -30,7 +31,7 @@ func newTestHandler(t *testing.T, backends []BackendConfig, attempts int, retryC
 	return h
 }
 
-func TestAdaptiveHandlerProxiesPathQueryAndRange(t *testing.T) {
+func TestAdaptiveProxyProxiesPathQueryAndRange(t *testing.T) {
 	type observedRequest struct{ path, rangeHeader, host string }
 	observed := make(chan observedRequest, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -76,7 +77,7 @@ func TestAdaptiveHandlerProxiesPathQueryAndRange(t *testing.T) {
 	}
 }
 
-func TestAdaptiveHandlerRetriesConfiguredStatusOnDifferentBackend(t *testing.T) {
+func TestAdaptiveProxyRetriesConfiguredStatusOnDifferentBackend(t *testing.T) {
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = io.WriteString(w, "unavailable")
@@ -118,7 +119,7 @@ func TestAdaptiveHandlerRetriesConfiguredStatusOnDifferentBackend(t *testing.T) 
 	}
 }
 
-func TestAdaptiveHandlerDoesNotRetry404(t *testing.T) {
+func TestAdaptiveProxyDoesNotRetry404(t *testing.T) {
 	var calls atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
@@ -144,7 +145,7 @@ func TestAdaptiveHandlerDoesNotRetry404(t *testing.T) {
 	}
 }
 
-func TestAdaptiveHandlerRetriesNetworkFailure(t *testing.T) {
+func TestAdaptiveProxyRetriesNetworkFailure(t *testing.T) {
 	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	deadURL := dead.URL
 	dead.Close()
@@ -167,7 +168,7 @@ func TestAdaptiveHandlerRetriesNetworkFailure(t *testing.T) {
 	}
 }
 
-func TestAdaptiveHandlerDoesNotRetryAfterBodyStarted(t *testing.T) {
+func TestAdaptiveProxyDoesNotRetryAfterBodyStarted(t *testing.T) {
 	var calls atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
@@ -262,6 +263,8 @@ func TestCircuitBreakerOpensAndRecoversAfterCooldown(t *testing.T) {
 
 func TestStatisticsEndpointRequiresAllowedRemoteIP(t *testing.T) {
 	h := newTestHandler(t, []BackendConfig{{Name: "local", URL: "http://127.0.0.1:1"}}, 1, nil)
+	// Statistics are disabled by default; enable them explicitly for this test.
+	h.Statistics.Enabled = boolPtr(true)
 	req := httptest.NewRequest(http.MethodGet, "http://invidious.test/_adaptive/status", nil)
 	req.RemoteAddr = "192.0.2.20:12345"
 	res := httptest.NewRecorder()
@@ -275,6 +278,8 @@ func TestStatisticsEndpointRequiresAllowedRemoteIP(t *testing.T) {
 
 func TestStatisticsEndpointReturnsJSONForLoopback(t *testing.T) {
 	h := newTestHandler(t, []BackendConfig{{Name: "local", URL: "http://127.0.0.1:1"}}, 1, nil)
+	// Statistics are disabled by default; enable them explicitly for this test.
+	h.Statistics.Enabled = boolPtr(true)
 	req := httptest.NewRequest(http.MethodGet, "http://invidious.test/_adaptive/status", nil)
 	req.RemoteAddr = "127.0.0.1:12345"
 	res := httptest.NewRecorder()
@@ -283,5 +288,96 @@ func TestStatisticsEndpointReturnsJSONForLoopback(t *testing.T) {
 	}
 	if res.Code != http.StatusOK || !strings.Contains(res.Header().Get("Content-Type"), "application/json") || !strings.Contains(res.Body.String(), `"local"`) {
 		t.Fatalf("unexpected stats response: status=%d headers=%v body=%s", res.Code, res.Header(), res.Body.String())
+	}
+}
+
+func TestAdaptiveProxyHeaderUpAndHeaderDown(t *testing.T) {
+	type observed struct {
+		via       string
+		forwarded string
+		realIP    string
+		custom    string
+		userAgent string
+	}
+	seen := make(chan observed, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- observed{
+			via:       r.Header.Get("Via"),
+			forwarded: r.Header.Get("X-Forwarded-For"),
+			realIP:    r.Header.Get("X-Real-IP"),
+			custom:    r.Header.Get("X-Proxy-Test"),
+			userAgent: r.Header.Get("User-Agent"),
+		}
+		w.Header().Set("Server", "upstream-fingerprint")
+		w.Header().Set("Via", "upstream-proxy")
+		w.Header().Set("X-Upstream", "preserved")
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	h := &Handler{
+		Backends: []BackendConfig{{Name: "upstream", URL: upstream.URL}},
+		Headers: &caddyheaders.Handler{
+			Request: &caddyheaders.HeaderOps{
+				Delete: []string{"Via", "X-Forwarded-*", "X-Real-IP", "User-Agent"},
+				Set:    http.Header{"X-Proxy-Test": []string{"configured"}},
+			},
+			Response: &caddyheaders.RespHeaderOps{
+				HeaderOps: &caddyheaders.HeaderOps{
+					Delete: []string{"Server", "Via"},
+					Set:    http.Header{"X-Response-Filtered": []string{"yes"}},
+				},
+				Deferred: true,
+			},
+		},
+	}
+	h.applyDefaults()
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Cleanup() })
+
+	req := httptest.NewRequest(http.MethodGet, "http://invidious.test/video", nil)
+	req.Header.Set("Via", "incoming-proxy")
+	req.Header.Set("X-Forwarded-For", "198.51.100.1")
+	req.Header.Set("X-Real-IP", "198.51.100.1")
+	req.Header.Set("User-Agent", "incoming-browser-agent")
+	rr := httptest.NewRecorder()
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+
+	got := <-seen
+	if got.via != "" || got.forwarded != "" || got.realIP != "" {
+		t.Fatalf("header_up did not remove proxy headers: %+v", got)
+	}
+	if got.custom != "configured" {
+		t.Fatalf("header_up set value=%q; want configured", got.custom)
+	}
+	if got.userAgent != "" {
+		t.Fatalf("deleted User-Agent was replaced by transport default %q", got.userAgent)
+	}
+	if rr.Header().Get("Server") != "" || rr.Header().Get("Via") != "" {
+		t.Fatalf("header_down left fingerprint headers: %v", rr.Header())
+	}
+	if rr.Header().Get("X-Upstream") != "preserved" || rr.Header().Get("X-Response-Filtered") != "yes" {
+		t.Fatalf("header_down did not preserve/set expected headers: %v", rr.Header())
+	}
+}
+
+func TestStatisticsTracksTerminalOutcomesAndTiming(t *testing.T) {
+	m := newMetricsCollector([]BackendConfig{{Name: "one", URL: "http://one"}})
+	m.recordRequest()
+	m.recordAttempt("one")
+	m.recordCompletion("one", 150*time.Millisecond, 40*time.Millisecond, 110*time.Millisecond, 1100, false, true)
+	m.recordOutcome("completed_successfully")
+	m.recordRequest()
+	m.recordOutcome("client_cancellation")
+	backends, global := m.Snapshot()
+	if global["requests"] != 2 || global["in_progress"] != 0 || global["outcome_completed_successfully"] != 1 || global["outcome_client_cancellation"] != 1 {
+		t.Fatalf("unexpected request accounting: %#v", global)
+	}
+	if backends[0].LastTTFB != "40ms" || backends[0].LastTransferDuration != "110ms" || backends[0].AverageThroughputBytesSec <= 0 {
+		t.Fatalf("unexpected timing metrics: %+v", backends[0])
 	}
 }

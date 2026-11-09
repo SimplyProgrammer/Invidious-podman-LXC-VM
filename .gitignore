@@ -1,6 +1,8 @@
 .env
 *.dbg.py
 *.dbg.sh
+*.bac
+*.bac/
 
 Caddyfile
 

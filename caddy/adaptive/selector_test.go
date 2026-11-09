@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func testPool(t *testing.T, configs []BackendConfig, maxPenalty *int) *BackendPool {
+func testPool(t *testing.T, configs []BackendConfig, maxPenalty *float64) *BackendPool {
 	t.Helper()
 
 	pool, err := newBackendPool(
@@ -92,7 +92,7 @@ func TestPenaltyIncreaseAndRecovery(t *testing.T) {
 }
 
 func TestMaxPenaltyCapsAccumulation(t *testing.T) {
-	capValue := 4
+	capValue := 4.0
 
 	pool := testPool(t, []BackendConfig{
 		{Name: "remote", URL: "https://remote.example", Penalty: 1},
@@ -103,12 +103,12 @@ func TestMaxPenaltyCapsAccumulation(t *testing.T) {
 	}
 
 	if got := pool.Snapshot()[0].Penalty; got != 4 {
-		t.Fatalf("penalty=%d; want 4", got)
+		t.Fatalf("penalty=%v; want 4", got)
 	}
 }
 
 func TestMaxPenaltyCannotBeBelowInitialPenalty(t *testing.T) {
-	capValue := 0
+	capValue := 0.0
 
 	_, err := newBackendPool(
 		[]BackendConfig{
@@ -136,7 +136,7 @@ func TestUnknownBackendPenalty(t *testing.T) {
 
 func TestPenaltyWeights(t *testing.T) {
 	tests := []struct {
-		penalty uint64
+		penalty float64
 		want    float64
 	}{
 		{penalty: 0, want: 1.0},
@@ -148,9 +148,54 @@ func TestPenaltyWeights(t *testing.T) {
 		got := penaltyWeight(test.penalty)
 		if got != test.want {
 			t.Errorf(
-				"penaltyWeight(%d) = %v; want %v",
+				"penaltyWeight(%v) = %v; want %v",
 				test.penalty, got, test.want,
 			)
 		}
+	}
+}
+
+func TestFractionalPenaltyIncreaseAndRecovery(t *testing.T) {
+	recovery := 0.25
+	pool, err := newBackendPool(
+		[]BackendConfig{{Name: "remote", URL: "https://remote.example", Penalty: 0.5}},
+		nil,
+		time.Hour,
+		recovery,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+
+	if err := pool.AddPenalty("remote", 1.25); err != nil {
+		t.Fatal(err)
+	}
+	if got := pool.Snapshot()[0].Penalty; got != 1.75 {
+		t.Fatalf("penalty=%v; want 1.75", got)
+	}
+	pool.RecoverNow()
+	if got := pool.Snapshot()[0].Penalty; got != 1.5 {
+		t.Fatalf("penalty after fractional recovery=%v; want 1.5", got)
+	}
+	pool.RecoverNow()
+	pool.RecoverNow()
+	pool.RecoverNow()
+	pool.RecoverNow()
+	if got := pool.Snapshot()[0].Penalty; got != 0.5 {
+		t.Fatalf("penalty after recovery=%v; want initial 0.5", got)
+	}
+}
+
+func TestFractionalMaxPenalty(t *testing.T) {
+	capValue := 2.75
+	pool := testPool(t, []BackendConfig{
+		{Name: "remote", URL: "https://remote.example", Penalty: 0.5},
+	}, &capValue)
+	if err := pool.AddPenalty("remote", 5.125); err != nil {
+		t.Fatal(err)
+	}
+	if got := pool.Snapshot()[0].Penalty; got != 2.75 {
+		t.Fatalf("penalty=%v; want cap 2.75", got)
 	}
 }

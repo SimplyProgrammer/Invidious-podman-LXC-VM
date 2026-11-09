@@ -11,6 +11,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	caddyheaders "github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
 )
 
 // BackendConfig describes one upstream and its starting penalty.
@@ -114,7 +115,7 @@ func boolPtr(v bool) *bool { return &v }
 //
 // Syntax:
 //
-//	adaptive_playback {
+//	adaptive_proxy {
 //	    selection adaptive_weighted_random
 //	    latency_threshold 6s
 //	    latency_penalty 1
@@ -124,6 +125,10 @@ func boolPtr(v bool) *bool { return &v }
 //	    max_attempts 3
 //	    # max_penalty omitted means unlimited
 //	    retry_status_codes 401-403 405-499 500-599
+//	    header_up -Via
+//	    header_up -X-Forwarded-*
+//	    header_down -Server
+//	    header_down -Via
 //	    backend local http://main-be:1234 {
 //	        penalty 0
 //	    }
@@ -145,8 +150,8 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	if !d.Next() {
 		return d.EOFErr()
 	}
-	if d.Val() != "adaptive_playback" {
-		return d.Errf("expected adaptive_playback, got %q", d.Val())
+	if d.Val() != "adaptive_proxy" {
+		return d.Errf("expected adaptive_proxy, got %q", d.Val())
 	}
 	if d.NextArg() {
 		return d.ArgErr()
@@ -156,9 +161,9 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
 		key := d.Val()
 
-		// Multiple backend directives are expected; all other top-level
+		// Backend and header operations may be repeated; other top-level
 		// directives may appear only once.
-		if key != "backend" {
+		if key != "backend" && key != "header_up" && key != "header_down" {
 			if seen[key] {
 				return d.Errf("directive %q may only be specified once", key)
 			}
@@ -233,6 +238,31 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			h.RetryStatusCodes = codes
 
+		case "header_up":
+			if h.Headers == nil {
+				h.Headers = new(caddyheaders.Handler)
+			}
+			if h.Headers.Request == nil {
+				h.Headers.Request = new(caddyheaders.HeaderOps)
+			}
+			if err := parseHeaderOperation(d, h.Headers.Request); err != nil {
+				return err
+			}
+
+		case "header_down":
+			if h.Headers == nil {
+				h.Headers = new(caddyheaders.Handler)
+			}
+			if h.Headers.Response == nil {
+				h.Headers.Response = &caddyheaders.RespHeaderOps{
+					HeaderOps: new(caddyheaders.HeaderOps),
+					Deferred:  true,
+				}
+			}
+			if err := parseHeaderOperation(d, h.Headers.Response.HeaderOps); err != nil {
+				return err
+			}
+
 		case "backend":
 			backend, err := parseBackend(d)
 			if err != nil {
@@ -261,12 +291,35 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			h.Statistics = cfg
 
 		default:
-			return d.Errf("unknown adaptive_playback option %q", key)
+			return d.Errf("unknown adaptive_proxy option %q", key)
 		}
 	}
 
 	h.applyDefaults()
 	return h.validate()
+}
+
+func parseHeaderOperation(d *caddyfile.Dispenser, ops *caddyheaders.HeaderOps) error {
+	args := d.RemainingArgs()
+	var field, value string
+	var replacement *string
+
+	switch len(args) {
+	case 1:
+		field = args[0]
+	case 2:
+		field, value = args[0], args[1]
+	case 3:
+		field, value = args[0], args[1]
+		replacement = &args[2]
+	default:
+		return d.ArgErr()
+	}
+
+	if err := caddyheaders.CaddyfileHeaderOp(ops, field, value, replacement); err != nil {
+		return d.Err(err.Error())
+	}
+	return nil
 }
 
 func parseBackend(d *caddyfile.Dispenser) (BackendConfig, error) {

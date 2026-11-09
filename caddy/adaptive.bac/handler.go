@@ -16,20 +16,21 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	caddyheaders "github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
 )
 
 func init() {
 	caddy.RegisterModule(Handler{})
 
-	httpcaddyfile.RegisterHandlerDirective("adaptive_playback", parseCaddyfile)
+	httpcaddyfile.RegisterHandlerDirective("adaptive_proxy", parseCaddyfile)
 	httpcaddyfile.RegisterDirectiveOrder(
-		"adaptive_playback",
+		"adaptive_proxy",
 		httpcaddyfile.Before,
 		"reverse_proxy",
 	)
 }
 
-// Handler is the adaptive playback HTTP middleware.
+// Handler is the adaptive proxy HTTP middleware.
 type Handler struct {
 	Selection        string                `json:"selection,omitempty"`
 	LatencyThreshold caddy.Duration        `json:"latency_threshold,omitempty"`
@@ -40,6 +41,7 @@ type Handler struct {
 	MaxAttempts      *int                  `json:"max_attempts,omitempty"`
 	MaxPenalty       *int                  `json:"max_penalty,omitempty"`
 	RetryStatusCodes []int                 `json:"retry_status_codes,omitempty"`
+	Headers          *caddyheaders.Handler `json:"headers,omitempty"`
 	Backends         []BackendConfig       `json:"backends,omitempty"`
 	CircuitBreaker   *CircuitBreakerConfig `json:"circuit_breaker,omitempty"`
 	Statistics       *StatisticsConfig     `json:"statistics,omitempty"`
@@ -53,16 +55,24 @@ type Handler struct {
 
 func (Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "http.handlers.adaptive_playback",
+		ID:  "http.handlers.adaptive_proxy",
 		New: func() caddy.Module { return new(Handler) },
 	}
 }
 
 // Provision initializes shared backend state and the retry status lookup.
-func (h *Handler) Provision(_ caddy.Context) error {
+func (h *Handler) Provision(ctx caddy.Context) error {
 	h.applyDefaults()
 	if err := h.validate(); err != nil {
 		return err
+	}
+	if h.Headers != nil {
+		if err := h.Headers.Provision(ctx); err != nil {
+			return fmt.Errorf("provision header operations: %w", err)
+		}
+		if err := h.Headers.Validate(); err != nil {
+			return fmt.Errorf("validate header operations: %w", err)
+		}
 	}
 
 	pool, err := newBackendPool(
@@ -102,11 +112,11 @@ func (h *Handler) Cleanup() error {
 	return nil
 }
 
-// ServeHTTP chooses a backend independently for each incoming playback
+// ServeHTTP chooses a backend independently for each incoming
 // request. It retries only before response headers/body are committed.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.Handler) error {
 	if h.pool == nil {
-		return fmt.Errorf("adaptive_playback handler is not provisioned")
+		return fmt.Errorf("adaptive_proxy handler is not provisioned")
 	}
 
 	if h.Statistics != nil && *h.Statistics.Enabled && r.URL.Path == h.Statistics.Path {
@@ -114,6 +124,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 		return nil
 	}
 	h.metrics.recordRequest()
+	outcome := ""
+	defer func() { h.metrics.recordOutcome(outcome) }()
 
 	maxAttempts := *h.MaxAttempts
 	if maxAttempts > len(h.Backends) {
@@ -127,9 +139,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 
 	excluded := make(map[string]struct{}, maxAttempts)
 	var lastErr error
+	attemptsMade := 0
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if r.Context().Err() != nil {
+			outcome = "client_cancellation"
 			return nil
 		}
 
@@ -148,6 +162,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 		}
 		excluded[backend.Name] = struct{}{}
 		h.metrics.recordAttempt(backend.Name)
+		attemptsMade++
 
 		outReq, err := h.outboundRequest(r, backend, attempt > 0)
 		if err != nil {
@@ -163,6 +178,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 		resp, roundTripErr := http.DefaultTransport.RoundTrip(outReq)
 		if roundTripErr != nil {
 			if r.Context().Err() != nil || isClientCancellation(roundTripErr) {
+				h.metrics.recordCancellation(backend.Name)
+				outcome = "client_cancellation"
 				return nil
 			}
 			lastErr = roundTripErr
@@ -182,9 +199,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 			continue
 		}
 
+		responseReceived := time.Now()
+		ttfb := responseReceived.Sub(started)
 		if h.shouldRetryStatus(resp.StatusCode) && attempt+1 < maxAttempts {
 			lastErr = fmt.Errorf("upstream %s returned retryable HTTP status %d", backend.Name, resp.StatusCode)
-			h.recordBackendFailure(backend.Name, time.Since(started), 0, false)
+			h.penalize(backend.Name, *h.ErrorPenalty)
+			h.metrics.recordCompletion(backend.Name, ttfb, ttfb, 0, 0, false, false)
+			if h.breaker != nil {
+				h.breaker.RecordFailure(backend.Name, time.Now())
+			}
 			h.metrics.recordRetry(backend.Name)
 			closeAndDrain(resp.Body)
 			continue
@@ -199,12 +222,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 			h.penalize(backend.Name, *h.ErrorPenalty)
 		}
 
+		if h.Headers != nil && h.Headers.Response != nil && h.Headers.Response.HeaderOps != nil {
+			h.Headers.Response.ApplyTo(resp.Header, replacerForRequest(r))
+		}
 		copyResponseHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 
 		trackedWriter := &responseWriteTracker{ResponseWriter: w}
 		bytesWritten, copyErr := io.Copy(trackedWriter, resp.Body)
 		_ = resp.Body.Close()
+		transferDuration := time.Since(responseReceived)
 		duration := time.Since(started)
 
 		if copyErr != nil {
@@ -212,9 +239,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 			// corrupt the response. A downstream write failure/client disconnect
 			// is not evidence that the selected upstream is unhealthy.
 			if trackedWriter.writeErr == nil && r.Context().Err() == nil && !isClientCancellation(copyErr) {
-				h.recordBackendFailure(backend.Name, duration, uint64(bytesWritten), false)
+				h.penalize(backend.Name, *h.ErrorPenalty)
+				h.metrics.recordCompletion(backend.Name, duration, ttfb, transferDuration, uint64(bytesWritten), false, false)
+				if h.breaker != nil {
+					h.breaker.RecordFailure(backend.Name, time.Now())
+				}
+				outcome = "interrupted_transfer"
 				return fmt.Errorf("streaming response from backend %q: %w", backend.Name, copyErr)
 			}
+			h.metrics.recordCancellation(backend.Name)
+			outcome = "client_cancellation"
 			return nil
 		}
 
@@ -225,27 +259,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 		if statusFailure {
 			// The response was delivered, but its status is still a configured
 			// backend failure.
-			h.metrics.recordFailure(backend.Name, duration, uint64(bytesWritten), slow)
+			h.metrics.recordCompletion(backend.Name, duration, ttfb, transferDuration, uint64(bytesWritten), slow, false)
 			if h.breaker != nil {
 				h.breaker.RecordFailure(backend.Name, time.Now())
 			}
 		} else {
-			h.metrics.recordSuccess(backend.Name, duration, uint64(bytesWritten), slow)
+			h.metrics.recordCompletion(backend.Name, duration, ttfb, transferDuration, uint64(bytesWritten), slow, true)
 			if h.breaker != nil {
 				h.breaker.RecordSuccess(backend.Name)
 			}
+		}
+		if statusFailure {
+			outcome = "upstream_http_error"
+		} else if resp.StatusCode >= 400 {
+			outcome = "non_retryable_response"
+		} else {
+			outcome = "completed_successfully"
 		}
 		return nil
 	}
 
 	if r.Context().Err() != nil {
+		outcome = "client_cancellation"
 		return nil
 	}
 	if lastErr == nil {
 		lastErr = ErrNoEligibleBackend
 	}
-	h.metrics.recordExhausted()
-	http.Error(w, "all playback backends failed", http.StatusBadGateway)
+	if attemptsMade == 1 && lastErr != nil && !errors.Is(lastErr, ErrNoEligibleBackend) {
+		outcome = "upstream_connection_error"
+	} else {
+		outcome = "exhausted_retries"
+	}
+	http.Error(w, "all proxy backends failed", http.StatusBadGateway)
 	return nil
 }
 
@@ -356,7 +402,7 @@ func (h *Handler) outboundRequest(in *http.Request, backend BackendSnapshot, ret
 	out.RequestURI = ""
 
 	// RoundTrip consumes and closes the request body. Re-create it for each
-	// attempt when the caller supplied GetBody; normal playback GETs have none.
+	// attempt when the caller supplied GetBody; normal GET requests have no body.
 	if in.Body != nil && in.Body != http.NoBody {
 		if retry {
 			if in.GetBody == nil {
@@ -374,7 +420,31 @@ func (h *Handler) outboundRequest(in *http.Request, backend BackendSnapshot, ret
 	}
 
 	removeHopByHopHeaders(out.Header)
+	if h.Headers != nil && h.Headers.Request != nil {
+		// Caddy's HeaderOps.ApplyToRequest reads the request-scoped replacer.
+		// Ensure one is available in standalone tests as well as in Caddy's
+		// normal HTTP handler chain.
+		repl := replacerForRequest(in)
+		out = out.WithContext(context.WithValue(out.Context(), caddy.ReplacerCtxKey, repl))
+		h.Headers.Request.ApplyToRequest(out)
+	}
+	// Match Caddy reverse_proxy behavior: if no User-Agent is present (or
+	// header_up removed it), suppress net/http's default Go-http-client value.
+	if _, ok := out.Header["User-Agent"]; !ok {
+		out.Header.Set("User-Agent", "")
+	}
+	// Never allow hop-by-hop fields to be reintroduced by header_up.
+	removeHopByHopHeaders(out.Header)
 	return out, nil
+}
+
+func replacerForRequest(r *http.Request) *caddy.Replacer {
+	if r != nil {
+		if repl, ok := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer); ok && repl != nil {
+			return repl
+		}
+	}
+	return caddy.NewReplacer()
 }
 
 func cloneURL(in *url.URL) *url.URL {

@@ -3,6 +3,7 @@ package adaptive
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"sync"
 	"time"
@@ -13,23 +14,21 @@ var (
 	ErrUnknownBackend    = errors.New("unknown backend")
 )
 
-const maxUint64 = ^uint64(0)
-
 // BackendSnapshot is a read-only view of a backend's current state.
 // The statistics endpoint will use these snapshots later.
 type BackendSnapshot struct {
 	Name           string  `json:"name"`
 	URL            string  `json:"url"`
-	InitialPenalty uint64  `json:"initial_penalty"`
-	Penalty        uint64  `json:"penalty"`
+	InitialPenalty float64 `json:"initial_penalty"`
+	Penalty        float64 `json:"penalty"`
 	Weight         float64 `json:"weight"`
 }
 
 type backendState struct {
 	name           string
 	url            string
-	initialPenalty uint64
-	penalty        uint64
+	initialPenalty float64
+	penalty        float64
 }
 
 // BackendPool owns the shared state for all configured upstreams.
@@ -39,38 +38,38 @@ type BackendPool struct {
 	backends []*backendState
 	byName   map[string]*backendState
 
-	maxPenalty     *uint64
-	recoveryAmount uint64
+	maxPenalty     *float64
+	recoveryAmount float64
 
 	stop      chan struct{}
 	done      chan struct{}
 	closeOnce sync.Once
 }
 
-func newBackendPool(configs []BackendConfig, maxPenalty *int, recoveryInterval time.Duration, recoveryAmount int) (*BackendPool, error) {
+func newBackendPool(configs []BackendConfig, maxPenalty *float64, recoveryInterval time.Duration, recoveryAmount float64) (*BackendPool, error) {
 	if len(configs) == 0 {
 		return nil, errors.New("backend pool requires at least one backend")
 	}
 	if recoveryInterval <= 0 {
 		return nil, errors.New("recovery interval must be greater than zero")
 	}
-	if recoveryAmount < 1 {
-		return nil, errors.New("recovery amount must be at least one")
+	if !validPenalty(recoveryAmount) || recoveryAmount == 0 {
+		return nil, errors.New("recovery amount must be greater than zero")
 	}
 
 	pool := &BackendPool{
 		backends:       make([]*backendState, 0, len(configs)),
 		byName:         make(map[string]*backendState, len(configs)),
-		recoveryAmount: uint64(recoveryAmount),
+		recoveryAmount: recoveryAmount,
 		stop:           make(chan struct{}),
 		done:           make(chan struct{}),
 	}
 
 	if maxPenalty != nil {
-		if *maxPenalty < 0 {
-			return nil, errors.New("maximum penalty cannot be negative")
+		if !validPenalty(*maxPenalty) {
+			return nil, errors.New("maximum penalty must be a finite non-negative number")
 		}
-		capValue := uint64(*maxPenalty)
+		capValue := *maxPenalty
 		pool.maxPenalty = &capValue
 	}
 
@@ -78,18 +77,18 @@ func newBackendPool(configs []BackendConfig, maxPenalty *int, recoveryInterval t
 		if cfg.Name == "" {
 			return nil, errors.New("backend name cannot be empty")
 		}
-		if cfg.Penalty < 0 {
-			return nil, fmt.Errorf("backend %q has a negative initial penalty", cfg.Name)
+		if !validPenalty(cfg.Penalty) {
+			return nil, fmt.Errorf("backend %q initial penalty must be finite and non-negative", cfg.Name)
 		}
 		if _, exists := pool.byName[cfg.Name]; exists {
 			return nil, fmt.Errorf("duplicate backend name %q", cfg.Name)
 		}
 
-		initial := uint64(cfg.Penalty)
+		initial := cfg.Penalty
 
 		if pool.maxPenalty != nil && initial > *pool.maxPenalty {
 			return nil, fmt.Errorf(
-				"backend %q initial penalty %d exceeds max_penalty %d",
+				"backend %q initial penalty %v exceeds max_penalty %v",
 				cfg.Name, initial, *pool.maxPenalty,
 			)
 		}
@@ -161,9 +160,12 @@ func (p *BackendPool) Select(excluded map[string]struct{}) (BackendSnapshot, err
 }
 
 // AddPenalty increases a backend's penalty.
-// A nil max_penalty means unlimited growth, up to uint64 saturation.
-func (p *BackendPool) AddPenalty(name string, amount int) error {
-	if amount <= 0 {
+// A nil max_penalty means unlimited growth.
+func (p *BackendPool) AddPenalty(name string, amount float64) error {
+	if !validPenalty(amount) {
+		return fmt.Errorf("penalty increment must be a finite non-negative number")
+	}
+	if amount == 0 {
 		return nil
 	}
 
@@ -175,12 +177,9 @@ func (p *BackendPool) AddPenalty(name string, amount int) error {
 		return fmt.Errorf("%w: %s", ErrUnknownBackend, name)
 	}
 
-	increment := uint64(amount)
-
-	if maxUint64-backend.penalty < increment {
-		backend.penalty = maxUint64
-	} else {
-		backend.penalty += increment
+	backend.penalty += amount
+	if math.IsInf(backend.penalty, 0) || math.IsNaN(backend.penalty) {
+		backend.penalty = math.MaxFloat64
 	}
 
 	if p.maxPenalty != nil && backend.penalty > *p.maxPenalty {
@@ -257,8 +256,8 @@ func (p *BackendPool) Close() {
 	})
 }
 
-func penaltyWeight(penalty uint64) float64 {
-	return 1.0 / (1.0 + float64(penalty))
+func penaltyWeight(penalty float64) float64 {
+	return 1.0 / (1.0 + penalty)
 }
 
 func snapshotOf(backend *backendState) BackendSnapshot {

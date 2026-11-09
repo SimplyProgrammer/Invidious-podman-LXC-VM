@@ -1,7 +1,9 @@
 package adaptive
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
@@ -43,5 +45,80 @@ adaptive_proxy {
 	}
 	if h.Headers.Request.Set == nil || h.Headers.Response.Set == nil {
 		t.Fatal("expected populated header operation maps")
+	}
+}
+
+func TestLatencyPenaltyModesAndDefaults(t *testing.T) {
+	h := &Handler{Backends: []BackendConfig{{Name: "local", URL: "http://127.0.0.1:3000"}}}
+	h.applyDefaults()
+	if timeDuration := time.Duration(h.LatencyThreshold); timeDuration != 4*time.Second {
+		t.Fatalf("default latency_threshold=%s; want 4s", timeDuration)
+	}
+	if h.LatencyPenalty == nil || !h.LatencyPenalty.Proportional || h.LatencyPenalty.Value != 1 {
+		t.Fatalf("default latency_penalty=%+v; want 1x", h.LatencyPenalty)
+	}
+
+	tests := []struct {
+		input        string
+		wantValue    float64
+		proportional bool
+	}{
+		{input: "1", wantValue: 1},
+		{input: "0.5", wantValue: 0.5},
+		{input: "1x", wantValue: 1, proportional: true},
+		{input: "2.5x", wantValue: 2.5, proportional: true},
+	}
+	for _, test := range tests {
+		d := caddyfile.NewTestDispenser("adaptive_proxy {\n latency_penalty " + test.input + "\n backend local http://127.0.0.1:3000\n}")
+		parsed := new(Handler)
+		if err := parsed.UnmarshalCaddyfile(d); err != nil {
+			t.Fatalf("parse %q: %v", test.input, err)
+		}
+		if parsed.LatencyPenalty.Value != test.wantValue || parsed.LatencyPenalty.Proportional != test.proportional {
+			t.Errorf("latency_penalty %q parsed as %+v", test.input, parsed.LatencyPenalty)
+		}
+	}
+}
+
+func TestLatencyPenaltyJSONRoundTrip(t *testing.T) {
+	for _, input := range []string{`1`, `0.5`, `"1x"`, `"2.5x"`} {
+		var got LatencyPenaltyConfig
+		if err := json.Unmarshal([]byte(input), &got); err != nil {
+			t.Fatalf("unmarshal %s: %v", input, err)
+		}
+		encoded, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", input, err)
+		}
+		var roundTrip LatencyPenaltyConfig
+		if err := json.Unmarshal(encoded, &roundTrip); err != nil {
+			t.Fatalf("round-trip %s: %v", input, err)
+		}
+		if got != roundTrip {
+			t.Errorf("round-trip %s: got %+v, want %+v", input, roundTrip, got)
+		}
+	}
+}
+
+func TestCaddyfileParsesFractionalPenaltySettings(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`
+adaptive_proxy {
+    error_penalty 1.5
+    recovery_amount 0.25
+    max_penalty 10.5
+    backend remote https://remote.example {
+        penalty 0.5
+    }
+}`)
+	h := new(Handler)
+	if err := h.UnmarshalCaddyfile(d); err != nil {
+		t.Fatal(err)
+	}
+	if *h.ErrorPenalty != 1.5 || *h.RecoveryAmount != 0.25 || *h.MaxPenalty != 10.5 {
+		t.Fatalf("fractional settings parsed incorrectly: error=%v recovery=%v max=%v",
+			*h.ErrorPenalty, *h.RecoveryAmount, *h.MaxPenalty)
+	}
+	if h.Backends[0].Penalty != 0.5 {
+		t.Fatalf("backend penalty=%v; want 0.5", h.Backends[0].Penalty)
 	}
 }
