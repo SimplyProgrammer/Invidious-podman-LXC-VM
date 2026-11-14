@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,19 +34,21 @@ func init() {
 
 // Handler is the adaptive proxy HTTP middleware.
 type Handler struct {
-	Selection        string                `json:"selection,omitempty"`
-	LatencyThreshold caddy.Duration        `json:"latency_threshold,omitempty"`
-	LatencyPenalty   *LatencyPenaltyConfig `json:"latency_penalty,omitempty"`
-	ErrorPenalty     *float64              `json:"error_penalty,omitempty"`
-	RecoveryInterval caddy.Duration        `json:"recovery_interval,omitempty"`
-	RecoveryAmount   *float64              `json:"recovery_amount,omitempty"`
-	MaxAttempts      *int                  `json:"max_attempts,omitempty"`
-	MaxPenalty       *float64              `json:"max_penalty,omitempty"`
-	RetryStatusCodes []int                 `json:"retry_status_codes,omitempty"`
-	Headers          *caddyheaders.Handler `json:"headers,omitempty"`
-	Backends         []BackendConfig       `json:"backends,omitempty"`
-	CircuitBreaker   *CircuitBreakerConfig `json:"circuit_breaker,omitempty"`
-	Statistics       *StatisticsConfig     `json:"statistics,omitempty"`
+	Selection            string                `json:"selection,omitempty"`
+	LatencyThreshold     caddy.Duration        `json:"latency_threshold,omitempty"`
+	LatencyPenalty       *LatencyPenaltyConfig `json:"latency_penalty,omitempty"`
+	ErrorPenalty         *float64              `json:"error_penalty,omitempty"`
+	RecoveryInterval     caddy.Duration        `json:"recovery_interval,omitempty"`
+	RecoveryAmount       *float64              `json:"recovery_amount,omitempty"`
+	MaxAttempts          *int                  `json:"max_attempts,omitempty"`
+	MaxAttemptsAuto      bool                  `json:"max_attempts_auto,omitempty"`
+	PassThroughLastError *bool                 `json:"pass_through_last_error,omitempty"`
+	MaxPenalty           *float64              `json:"max_penalty,omitempty"`
+	RetryStatusCodes     []int                 `json:"retry_status_codes,omitempty"`
+	Headers              *caddyheaders.Handler `json:"headers,omitempty"`
+	Backends             []BackendConfig       `json:"backends,omitempty"`
+	CircuitBreaker       *CircuitBreakerConfig `json:"circuit_breaker,omitempty"`
+	Statistics           *StatisticsConfig     `json:"statistics,omitempty"`
 
 	pool            *BackendPool
 	metrics         *MetricsCollector
@@ -128,16 +132,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 	defer func() { h.metrics.recordOutcome(outcome) }()
 
 	maxAttempts := *h.MaxAttempts
-	if maxAttempts > len(h.Backends) {
+	if h.MaxAttemptsAuto {
+		maxAttempts = len(h.Backends)
+	} else if maxAttempts > len(h.Backends) {
 		maxAttempts = len(h.Backends)
 	}
 	// A non-replayable request body can be sent only once. Playback traffic
 	// is normally GET/HEAD, but this keeps the middleware safe for other methods.
-	if r.Body != nil && r.Body != http.NoBody && r.GetBody == nil {
+	if requestHasBody(r) && r.GetBody == nil {
 		maxAttempts = 1
 	}
 
 	excluded := make(map[string]struct{}, maxAttempts)
+	var autoCandidates []BackendSnapshot
 	var lastErr error
 	attemptsMade := 0
 
@@ -156,9 +163,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 				}
 			}
 		}
-		backend, err := h.pool.Select(excluded)
-		if err != nil {
-			break
+		var backend BackendSnapshot
+		var err error
+		if h.MaxAttemptsAuto && attempt > 0 {
+			for len(autoCandidates) > 0 {
+				backend = autoCandidates[0]
+				autoCandidates = autoCandidates[1:]
+				if h.breaker == nil || h.breaker.Allow(backend.Name, time.Now()) {
+					break
+				}
+				backend = BackendSnapshot{}
+			}
+			if backend.Name == "" {
+				break
+			}
+		} else {
+			backend, err = h.pool.Select(excluded)
+			if err != nil {
+				break
+			}
 		}
 		excluded[backend.Name] = struct{}{}
 		h.metrics.recordAttempt(backend.Name)
@@ -168,7 +191,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 		if err != nil {
 			lastErr = err
 			h.recordBackendFailure(backend.Name, 0, 0, false)
-			if attempt+1 < maxAttempts {
+			willRetry := attempt+1 < maxAttempts
+			if h.MaxAttemptsAuto {
+				autoCandidates = h.autoRetryCandidates(excluded)
+				willRetry = len(autoCandidates) > 0 && attempt+1 < maxAttempts
+			}
+			if willRetry {
 				h.metrics.recordRetry(backend.Name)
 			}
 			continue
@@ -184,7 +212,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 			}
 			lastErr = roundTripErr
 			h.recordBackendFailure(backend.Name, time.Since(started), 0, false)
-			if attempt+1 < maxAttempts {
+			willRetry := attempt+1 < maxAttempts
+			if h.MaxAttemptsAuto {
+				autoCandidates = h.autoRetryCandidates(excluded)
+				willRetry = len(autoCandidates) > 0 && attempt+1 < maxAttempts
+			}
+			if willRetry {
 				h.metrics.recordRetry(backend.Name)
 			}
 			continue
@@ -193,7 +226,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 		if resp == nil {
 			lastErr = errors.New("upstream returned an empty response")
 			h.recordBackendFailure(backend.Name, time.Since(started), 0, false)
-			if attempt+1 < maxAttempts {
+			willRetry := attempt+1 < maxAttempts
+			if h.MaxAttemptsAuto {
+				autoCandidates = h.autoRetryCandidates(excluded)
+				willRetry = len(autoCandidates) > 0 && attempt+1 < maxAttempts
+			}
+			if willRetry {
 				h.metrics.recordRetry(backend.Name)
 			}
 			continue
@@ -201,25 +239,52 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 
 		responseReceived := time.Now()
 		ttfb := responseReceived.Sub(started)
-		if h.shouldRetryStatus(resp.StatusCode) && attempt+1 < maxAttempts {
+		if h.shouldRetryStatus(resp.StatusCode) {
 			lastErr = fmt.Errorf("upstream %s returned retryable HTTP status %d", backend.Name, resp.StatusCode)
 			h.penalize(backend.Name, *h.ErrorPenalty)
-			h.metrics.recordCompletion(backend.Name, ttfb, ttfb, 0, 0, false, false)
-			if h.breaker != nil {
-				h.breaker.RecordFailure(backend.Name, time.Now())
+			canRetry := attempt+1 < maxAttempts
+			if h.MaxAttemptsAuto {
+				autoCandidates = h.autoRetryCandidates(excluded)
+				canRetry = len(autoCandidates) > 0 && attempt+1 < maxAttempts
 			}
-			h.metrics.recordRetry(backend.Name)
-			closeAndDrain(resp.Body)
-			continue
+			if canRetry {
+				h.metrics.recordCompletion(backend.Name, ttfb, ttfb, 0, 0, false, false)
+				if h.breaker != nil {
+					h.breaker.RecordFailure(backend.Name, time.Now())
+				}
+				h.metrics.recordRetry(backend.Name)
+				closeAndDrain(resp.Body)
+				continue
+			}
 		}
 
 		// If this is a retryable status but there are no remaining attempts,
 		// return the actual upstream response rather than replacing it with 502.
 		statusFailure := h.shouldRetryStatus(resp.StatusCode)
 		if statusFailure {
-			// Apply the penalty now, but count the completed failure and update
-			// the breaker only after the response body has been consumed.
-			h.penalize(backend.Name, *h.ErrorPenalty)
+			// The retryable status has already been penalized and recorded as a
+			// failed attempt above. Here we only decide how to expose its response.
+			if h.PassThroughLastError != nil && !*h.PassThroughLastError {
+				bytesRead, _ := io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				duration := time.Since(started)
+				transferDuration := time.Since(responseReceived)
+				slow := duration > time.Duration(h.LatencyThreshold)
+				if slow {
+					latencyPenalty := h.LatencyPenalty.Value
+					if h.LatencyPenalty.Proportional {
+						latencyPenalty *= float64(duration) / float64(time.Duration(h.LatencyThreshold))
+					}
+					h.penalize(backend.Name, latencyPenalty)
+				}
+				h.metrics.recordCompletion(backend.Name, duration, ttfb, transferDuration, uint64(bytesRead), slow, false)
+				if h.breaker != nil {
+					h.breaker.RecordFailure(backend.Name, time.Now())
+				}
+				outcome = "exhausted_retries"
+				http.Error(w, "all proxy backends failed", http.StatusBadGateway)
+				return nil
+			}
 		}
 
 		if h.Headers != nil && h.Headers.Response != nil && h.Headers.Response.HeaderOps != nil {
@@ -274,7 +339,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 			}
 		}
 		if statusFailure {
-			outcome = "upstream_http_error"
+			// A retryable response reached the client only because no further
+			// eligible attempt remained. Count this as exhausted even when its
+			// original upstream response is passed through unchanged.
+			outcome = "exhausted_retries"
 		} else if resp.StatusCode >= 400 {
 			outcome = "non_retryable_response"
 		} else {
@@ -297,6 +365,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 	}
 	http.Error(w, "all proxy backends failed", http.StatusBadGateway)
 	return nil
+}
+
+// autoRetryCandidates returns untried, currently eligible backends ordered by
+// effective weight (best first). Equal-weight groups are shuffled to avoid
+// configuration-order bias.
+func (h *Handler) autoRetryCandidates(excluded map[string]struct{}) []BackendSnapshot {
+	items := make([]BackendSnapshot, 0, len(h.Backends))
+	for _, item := range h.pool.Snapshot() {
+		if _, tried := excluded[item.Name]; tried {
+			continue
+		}
+		if h.breaker != nil && !h.breaker.Allow(item.Name, time.Now()) {
+			continue
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Weight > items[j].Weight })
+	for start := 0; start < len(items); {
+		end := start + 1
+		for end < len(items) && items[end].Weight == items[start].Weight {
+			end++
+		}
+		rand.Shuffle(end-start, func(i, j int) { items[start+i], items[start+j] = items[start+j], items[start+i] })
+		start = end
+	}
+	return items
 }
 
 // recordBackendFailure applies the configured penalty, updates the circuit
@@ -383,6 +477,12 @@ func (h *Handler) serveStatistics(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(doc)
 }
 
+// requestHasBody distinguishes an actual request entity from the non-nil,
+// immediately-EOF Body used by net/http for bodyless server requests.
+func requestHasBody(r *http.Request) bool {
+	return r != nil && r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0
+}
+
 func (h *Handler) outboundRequest(in *http.Request, backend BackendSnapshot, retry bool) (*http.Request, error) {
 	target, err := url.Parse(backend.URL)
 	if err != nil {
@@ -405,9 +505,12 @@ func (h *Handler) outboundRequest(in *http.Request, backend BackendSnapshot, ret
 	out.Host = target.Host
 	out.RequestURI = ""
 
-	// RoundTrip consumes and closes the request body. Re-create it for each
-	// attempt when the caller supplied GetBody; normal GET requests have no body.
-	if in.Body != nil && in.Body != http.NoBody {
+	// Server-side requests have a non-nil Body even when the HTTP request
+	// carries no entity. ContentLength == 0 identifies those bodyless requests;
+	// do not mistake them for non-replayable bodies or require GetBody on retry.
+	// RoundTrip consumes and closes actual request bodies, so those still need
+	// GetBody before a retry can safely recreate them.
+	if requestHasBody(in) {
 		if retry {
 			if in.GetBody == nil {
 				return nil, errors.New("request body cannot be replayed safely")
@@ -421,6 +524,9 @@ func (h *Handler) outboundRequest(in *http.Request, backend BackendSnapshot, ret
 		} else {
 			out.Body = in.Body
 		}
+	} else {
+		out.Body = http.NoBody
+		out.ContentLength = 0
 	}
 
 	removeHopByHopHeaders(out.Header)

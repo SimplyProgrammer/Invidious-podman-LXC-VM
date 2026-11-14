@@ -34,12 +34,12 @@ func init() {
 type Handler struct {
 	Selection        string                `json:"selection,omitempty"`
 	LatencyThreshold caddy.Duration        `json:"latency_threshold,omitempty"`
-	LatencyPenalty   *int                  `json:"latency_penalty,omitempty"`
-	ErrorPenalty     *int                  `json:"error_penalty,omitempty"`
+	LatencyPenalty   *LatencyPenaltyConfig `json:"latency_penalty,omitempty"`
+	ErrorPenalty     *float64              `json:"error_penalty,omitempty"`
 	RecoveryInterval caddy.Duration        `json:"recovery_interval,omitempty"`
-	RecoveryAmount   *int                  `json:"recovery_amount,omitempty"`
+	RecoveryAmount   *float64              `json:"recovery_amount,omitempty"`
 	MaxAttempts      *int                  `json:"max_attempts,omitempty"`
-	MaxPenalty       *int                  `json:"max_penalty,omitempty"`
+	MaxPenalty       *float64              `json:"max_penalty,omitempty"`
 	RetryStatusCodes []int                 `json:"retry_status_codes,omitempty"`
 	Headers          *caddyheaders.Handler `json:"headers,omitempty"`
 	Backends         []BackendConfig       `json:"backends,omitempty"`
@@ -254,7 +254,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 
 		slow := duration > time.Duration(h.LatencyThreshold)
 		if slow {
-			h.penalize(backend.Name, *h.LatencyPenalty)
+			latencyPenalty := h.LatencyPenalty.Value
+			if h.LatencyPenalty.Proportional {
+				latencyPenalty *= float64(duration) / float64(time.Duration(h.LatencyThreshold))
+			}
+			h.penalize(backend.Name, latencyPenalty)
 		}
 		if statusFailure {
 			// The response was delivered, but its status is still a configured
@@ -467,7 +471,7 @@ func (h *Handler) shouldRetryStatus(code int) bool {
 	return ok
 }
 
-func (h *Handler) penalize(name string, amount int) {
+func (h *Handler) penalize(name string, amount float64) {
 	if amount > 0 && h.pool != nil {
 		_ = h.pool.AddPenalty(name, amount)
 	}

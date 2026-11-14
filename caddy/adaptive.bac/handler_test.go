@@ -137,7 +137,7 @@ func TestAdaptiveProxyDoesNotRetry404(t *testing.T) {
 		t.Fatalf("status=%d calls=%d; want 404 and one call", rr.Code, calls.Load())
 	}
 	if got := h.pool.Snapshot()[0].Penalty; got != 0 {
-		t.Fatalf("404 changed penalty to %d; want 0", got)
+		t.Fatalf("404 changed penalty to %g; want 0", got)
 	}
 	metrics, _ := h.metrics.Snapshot()
 	if metrics[0].Successes != 1 || metrics[0].Failures != 0 {
@@ -379,5 +379,68 @@ func TestStatisticsTracksTerminalOutcomesAndTiming(t *testing.T) {
 	}
 	if backends[0].LastTTFB != "40ms" || backends[0].LastTransferDuration != "110ms" || backends[0].AverageThroughputBytesSec <= 0 {
 		t.Fatalf("unexpected timing metrics: %+v", backends[0])
+	}
+}
+
+func TestProportionalLatencyPenaltyUsesTotalDuration(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(30 * time.Millisecond)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	h := &Handler{
+		Backends:         []BackendConfig{{Name: "slow", URL: upstream.URL}},
+		MaxAttempts:      intPtr(1),
+		LatencyThreshold: caddy.Duration(10 * time.Millisecond),
+		LatencyPenalty:   &LatencyPenaltyConfig{Value: 1, Proportional: true},
+	}
+	h.applyDefaults()
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = h.Cleanup() })
+
+	req := httptest.NewRequest(http.MethodGet, "http://invidious.test/video", nil)
+	res := httptest.NewRecorder()
+	if err := h.ServeHTTP(res, req, nil); err != nil {
+		t.Fatal(err)
+	}
+	got := h.pool.Snapshot()[0].Penalty
+	if got < 3 {
+		t.Fatalf("proportional penalty=%v; want at least 3 for a 30ms+ response over 10ms threshold", got)
+	}
+	metrics, _ := h.metrics.Snapshot()
+	if metrics[0].SlowResponses != 1 {
+		t.Fatalf("slow_responses=%d; want 1", metrics[0].SlowResponses)
+	}
+}
+
+func TestFixedLatencyPenaltyRemainsBackwardCompatible(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(30 * time.Millisecond)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	h := &Handler{
+		Backends:         []BackendConfig{{Name: "slow", URL: upstream.URL}},
+		MaxAttempts:      intPtr(1),
+		LatencyThreshold: caddy.Duration(10 * time.Millisecond),
+		LatencyPenalty:   &LatencyPenaltyConfig{Value: 1, Proportional: false},
+	}
+	h.applyDefaults()
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = h.Cleanup() })
+
+	req := httptest.NewRequest(http.MethodGet, "http://invidious.test/video", nil)
+	res := httptest.NewRecorder()
+	if err := h.ServeHTTP(res, req, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.pool.Snapshot()[0].Penalty; got != 1 {
+		t.Fatalf("fixed latency penalty=%v; want exactly 1", got)
 	}
 }

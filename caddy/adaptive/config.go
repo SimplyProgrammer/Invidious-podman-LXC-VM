@@ -108,6 +108,10 @@ func (h *Handler) applyDefaults() {
 	}
 	if h.MaxAttempts == nil {
 		h.MaxAttempts = intPtr(3)
+		h.MaxAttemptsAuto = true
+	}
+	if h.PassThroughLastError == nil {
+		h.PassThroughLastError = boolPtr(true)
 	}
 	// A nil MaxPenalty intentionally means unlimited penalty.
 	if h.RetryStatusCodes == nil {
@@ -176,7 +180,8 @@ func boolPtr(v bool) *bool { return &v }
 //	    error_penalty 2
 //	    recovery_interval 10m
 //	    recovery_amount 1
-//	    max_attempts 3
+//	    max_attempts auto
+//	    pass_through_last_error true
 //	    # max_penalty omitted means unlimited
 //	    retry_status_codes 401-403 405-499 500-599
 //	    header_up -Via
@@ -272,11 +277,27 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			h.RecoveryAmount = floatPtr(value)
 
 		case "max_attempts":
-			value, err := intArg(d)
+			raw, err := oneArg(d)
 			if err != nil {
 				return err
 			}
-			h.MaxAttempts = intPtr(value)
+			if raw == "auto" {
+				h.MaxAttemptsAuto = true
+			} else {
+				value, parseErr := strconv.Atoi(raw)
+				if parseErr != nil {
+					return d.Errf("max_attempts must be auto or a positive integer")
+				}
+				h.MaxAttemptsAuto = false
+				h.MaxAttempts = intPtr(value)
+			}
+
+		case "pass_through_last_error":
+			value, err := boolArg(d)
+			if err != nil {
+				return err
+			}
+			h.PassThroughLastError = boolPtr(value)
 
 		case "max_penalty":
 			value, err := floatArg(d)

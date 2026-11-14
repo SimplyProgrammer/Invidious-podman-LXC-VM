@@ -444,3 +444,120 @@ func TestFixedLatencyPenaltyRemainsBackwardCompatible(t *testing.T) {
 		t.Fatalf("fixed latency penalty=%v; want exactly 1", got)
 	}
 }
+
+func TestAutoAttemptsExhaustEveryBackendAndPassThroughLastError(t *testing.T) {
+	var calls [3]atomic.Int64
+	servers := make([]*httptest.Server, 3)
+	backends := make([]BackendConfig, 3)
+	for i := range servers {
+		i := i
+		servers[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls[i].Add(1)
+			w.Header().Set("X-Upstream-Error", fmt.Sprintf("backend-%d", i))
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = fmt.Fprintf(w, "upstream-%d-unavailable", i)
+		}))
+		defer servers[i].Close()
+		backends[i] = BackendConfig{Name: fmt.Sprintf("backend-%d", i), URL: servers[i].URL}
+	}
+
+	h := &Handler{Backends: backends, MaxAttemptsAuto: true, RetryStatusCodes: []int{http.StatusServiceUnavailable}}
+	h.applyDefaults()
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	defer h.Cleanup()
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://invidious.test/video", nil)
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+
+	total := int64(0)
+	for i := range calls {
+		total += calls[i].Load()
+	}
+	if total != 3 {
+		t.Fatalf("total upstream attempts=%d; want 3", total)
+	}
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d; want final upstream 503", rr.Code)
+	}
+	if !strings.HasPrefix(rr.Body.String(), "upstream-") {
+		t.Fatalf("body=%q; expected upstream error body", rr.Body.String())
+	}
+	if rr.Header().Get("X-Upstream-Error") == "" {
+		t.Fatal("last upstream response header was not passed through")
+	}
+}
+
+func TestAutoRetriesBodylessServerRequestWithNonNilBody(t *testing.T) {
+	var calls [3]atomic.Int64
+	servers := make([]*httptest.Server, 3)
+	backends := make([]BackendConfig, 3)
+	for i := range servers {
+		i := i
+		servers[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls[i].Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = fmt.Fprintf(w, "upstream-%d-unavailable", i)
+		}))
+		defer servers[i].Close()
+		backends[i] = BackendConfig{Name: fmt.Sprintf("backend-%d", i), URL: servers[i].URL}
+	}
+
+	h := &Handler{Backends: backends, MaxAttemptsAuto: true, RetryStatusCodes: []int{http.StatusServiceUnavailable}}
+	h.applyDefaults()
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	defer h.Cleanup()
+
+	// net/http server requests have a non-nil Body even when ContentLength is
+	// zero. Simulate that shape rather than httptest.NewRequest's http.NoBody.
+	req := httptest.NewRequest(http.MethodGet, "http://invidious.test/video", nil)
+	req.Body = io.NopCloser(strings.NewReader(""))
+	req.ContentLength = 0
+	req.GetBody = nil
+	rr := httptest.NewRecorder()
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+
+	total := int64(0)
+	for i := range calls {
+		total += calls[i].Load()
+	}
+	if total != 3 {
+		t.Fatalf("total upstream attempts=%d; want all 3 backends tried", total)
+	}
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d; want final upstream 503", rr.Code)
+	}
+	_, global := h.metrics.Snapshot()
+	if global["attempts"] != 3 || global["retries"] != 2 || global["exhausted_requests"] != 1 {
+		t.Fatalf("unexpected retry metrics: %+v", global)
+	}
+}
+
+func TestPassThroughLastErrorCanBeDisabled(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, "upstream detail")
+	}))
+	defer upstream.Close()
+	h := &Handler{Backends: []BackendConfig{{Name: "only", URL: upstream.URL}}, MaxAttempts: intPtr(1), PassThroughLastError: boolPtr(false), RetryStatusCodes: []int{http.StatusServiceUnavailable}}
+	h.applyDefaults()
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	defer h.Cleanup()
+	rr := httptest.NewRecorder()
+	if err := h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "http://invidious.test/video", nil), nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if rr.Code != http.StatusBadGateway || strings.Contains(rr.Body.String(), "upstream detail") {
+		t.Fatalf("got %d %q; want synthetic 502", rr.Code, rr.Body.String())
+	}
+}

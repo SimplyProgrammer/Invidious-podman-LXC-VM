@@ -1,7 +1,9 @@
 package adaptive
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"sort"
@@ -16,14 +18,62 @@ import (
 
 // BackendConfig describes one upstream and its starting penalty.
 type BackendConfig struct {
-	Name    string `json:"name"`
-	URL     string `json:"url"`
-	Penalty int    `json:"penalty"`
+	Name    string  `json:"name"`
+	URL     string  `json:"url"`
+	Penalty float64 `json:"penalty"`
+}
+
+// LatencyPenaltyConfig supports either a fixed penalty (numeric Caddyfile value)
+// or a proportional penalty (a value suffixed with "x").
+type LatencyPenaltyConfig struct {
+	Value        float64
+	Proportional bool
+}
+
+func (p *LatencyPenaltyConfig) UnmarshalJSON(data []byte) error {
+	var numeric float64
+	if err := json.Unmarshal(data, &numeric); err == nil {
+		p.Value = numeric
+		p.Proportional = false
+		return nil
+	}
+	var raw string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("latency_penalty must be a number or a multiplier string")
+	}
+	value, proportional, err := parseLatencyPenalty(raw)
+	if err != nil {
+		return err
+	}
+	p.Value, p.Proportional = value, proportional
+	return nil
+}
+
+func (p LatencyPenaltyConfig) MarshalJSON() ([]byte, error) {
+	if p.Proportional {
+		return json.Marshal(strconv.FormatFloat(p.Value, 'f', -1, 64) + "x")
+	}
+	return json.Marshal(p.Value)
+}
+
+func parseLatencyPenalty(raw string) (float64, bool, error) {
+	proportional := strings.HasSuffix(raw, "x")
+	if proportional {
+		raw = strings.TrimSuffix(raw, "x")
+		if raw == "" {
+			return 0, false, fmt.Errorf("invalid latency_penalty multiplier")
+		}
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return 0, false, fmt.Errorf("latency_penalty must be a finite non-negative number optionally suffixed with x")
+	}
+	return value, proportional, nil
 }
 
 // CircuitBreakerConfig is optional. A nil config means the circuit breaker
 // is disabled. If the block is present, its defaults are enabled=true,
-// failure_threshold=3, and cooldown=60s.
+// failure_threshold=4, and cooldown=60s.
 type CircuitBreakerConfig struct {
 	Enabled          *bool          `json:"enabled,omitempty"`
 	FailureThreshold *int           `json:"failure_threshold,omitempty"`
@@ -42,19 +92,19 @@ func (h *Handler) applyDefaults() {
 		h.Selection = "adaptive_weighted_random"
 	}
 	if h.LatencyThreshold == 0 {
-		h.LatencyThreshold = caddy.Duration(6 * time.Second)
+		h.LatencyThreshold = caddy.Duration(4 * time.Second)
 	}
 	if h.LatencyPenalty == nil {
-		h.LatencyPenalty = intPtr(1)
+		h.LatencyPenalty = &LatencyPenaltyConfig{Value: 1, Proportional: true}
 	}
 	if h.ErrorPenalty == nil {
-		h.ErrorPenalty = intPtr(2)
+		h.ErrorPenalty = floatPtr(2)
 	}
 	if h.RecoveryInterval == 0 {
 		h.RecoveryInterval = caddy.Duration(10 * time.Minute)
 	}
 	if h.RecoveryAmount == nil {
-		h.RecoveryAmount = intPtr(1)
+		h.RecoveryAmount = floatPtr(1)
 	}
 	if h.MaxAttempts == nil {
 		h.MaxAttempts = intPtr(3)
@@ -108,7 +158,11 @@ func defaultRetryStatusCodes() []int {
 	return codes
 }
 
-func intPtr(v int) *int    { return &v }
+func intPtr(v int) *int           { return &v }
+func floatPtr(v float64) *float64 { return &v }
+func validPenalty(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0
+}
 func boolPtr(v bool) *bool { return &v }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
@@ -117,8 +171,8 @@ func boolPtr(v bool) *bool { return &v }
 //
 //	adaptive_proxy {
 //	    selection adaptive_weighted_random
-//	    latency_threshold 6s
-//	    latency_penalty 1
+//	    latency_threshold 4s
+//	    latency_penalty 1x
 //	    error_penalty 2
 //	    recovery_interval 10m
 //	    recovery_amount 1
@@ -186,18 +240,22 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			h.LatencyThreshold = caddy.Duration(value)
 
 		case "latency_penalty":
-			value, err := intArg(d)
+			raw, err := oneArg(d)
 			if err != nil {
 				return err
 			}
-			h.LatencyPenalty = intPtr(value)
+			value, proportional, err := parseLatencyPenalty(raw)
+			if err != nil {
+				return d.WrapErr(err)
+			}
+			h.LatencyPenalty = &LatencyPenaltyConfig{Value: value, Proportional: proportional}
 
 		case "error_penalty":
-			value, err := intArg(d)
+			value, err := floatArg(d)
 			if err != nil {
 				return err
 			}
-			h.ErrorPenalty = intPtr(value)
+			h.ErrorPenalty = floatPtr(value)
 
 		case "recovery_interval":
 			value, err := durationArg(d)
@@ -207,11 +265,11 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			h.RecoveryInterval = caddy.Duration(value)
 
 		case "recovery_amount":
-			value, err := intArg(d)
+			value, err := floatArg(d)
 			if err != nil {
 				return err
 			}
-			h.RecoveryAmount = intPtr(value)
+			h.RecoveryAmount = floatPtr(value)
 
 		case "max_attempts":
 			value, err := intArg(d)
@@ -221,11 +279,11 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			h.MaxAttempts = intPtr(value)
 
 		case "max_penalty":
-			value, err := intArg(d)
+			value, err := floatArg(d)
 			if err != nil {
 				return err
 			}
-			h.MaxPenalty = intPtr(value)
+			h.MaxPenalty = floatPtr(value)
 
 		case "retry_status_codes":
 			args := d.RemainingArgs()
@@ -332,7 +390,7 @@ func parseBackend(d *caddyfile.Dispenser) (BackendConfig, error) {
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
 		switch d.Val() {
 		case "penalty":
-			value, err := intArg(d)
+			value, err := floatArg(d)
 			if err != nil {
 				return backend, err
 			}
@@ -433,6 +491,18 @@ func intArg(d *caddyfile.Dispenser) (int, error) {
 	return value, nil
 }
 
+func floatArg(d *caddyfile.Dispenser) (float64, error) {
+	raw, err := oneArg(d)
+	if err != nil {
+		return 0, err
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, d.Errf("expected a finite number, got %q", raw)
+	}
+	return value, nil
+}
+
 func boolArg(d *caddyfile.Dispenser) (bool, error) {
 	raw, err := oneArg(d)
 	if err != nil {
@@ -500,23 +570,23 @@ func (h *Handler) validate() error {
 	if h.LatencyThreshold <= 0 {
 		return fmt.Errorf("latency_threshold must be greater than zero")
 	}
-	if h.LatencyPenalty == nil || *h.LatencyPenalty < 0 {
-		return fmt.Errorf("latency_penalty must be zero or greater")
+	if h.LatencyPenalty == nil || !validPenalty(h.LatencyPenalty.Value) {
+		return fmt.Errorf("latency_penalty must be a finite non-negative number")
 	}
-	if h.ErrorPenalty == nil || *h.ErrorPenalty < 0 {
-		return fmt.Errorf("error_penalty must be zero or greater")
+	if h.ErrorPenalty == nil || !validPenalty(*h.ErrorPenalty) {
+		return fmt.Errorf("error_penalty must be a finite non-negative number")
 	}
 	if h.RecoveryInterval <= 0 {
 		return fmt.Errorf("recovery_interval must be greater than zero")
 	}
-	if h.RecoveryAmount == nil || *h.RecoveryAmount < 1 {
-		return fmt.Errorf("recovery_amount must be at least 1")
+	if h.RecoveryAmount == nil || !validPenalty(*h.RecoveryAmount) || *h.RecoveryAmount == 0 {
+		return fmt.Errorf("recovery_amount must be greater than zero")
 	}
 	if h.MaxAttempts == nil || *h.MaxAttempts < 1 {
 		return fmt.Errorf("max_attempts must be at least 1")
 	}
-	if h.MaxPenalty != nil && *h.MaxPenalty < 0 {
-		return fmt.Errorf("max_penalty must be zero or greater")
+	if h.MaxPenalty != nil && !validPenalty(*h.MaxPenalty) {
+		return fmt.Errorf("max_penalty must be a finite non-negative number")
 	}
 	if len(h.Backends) == 0 {
 		return fmt.Errorf("at least one backend must be configured")
@@ -531,8 +601,8 @@ func (h *Handler) validate() error {
 			return fmt.Errorf("duplicate backend name %q", backend.Name)
 		}
 		backendNames[backend.Name] = struct{}{}
-		if backend.Penalty < 0 {
-			return fmt.Errorf("backend %q penalty must be zero or greater", backend.Name)
+		if !validPenalty(backend.Penalty) {
+			return fmt.Errorf("backend %q penalty must be a finite non-negative number", backend.Name)
 		}
 		u, err := url.Parse(backend.URL)
 		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {

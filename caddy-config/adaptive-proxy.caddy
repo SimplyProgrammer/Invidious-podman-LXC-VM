@@ -11,7 +11,8 @@ handle @adaptive_paths {
         recovery_interval 30m
         recovery_amount 1
 
-        max_attempts 4
+        max_attempts auto
+        pass_through_last_error true
 
         header_up -Via
         header_up -Forwarded
@@ -25,27 +26,27 @@ handle @adaptive_paths {
         }
 
         backend nadeko-us1 https://inv-us1.nadeko.net {
-            penalty 0.5
+            penalty 0
         }
 
         backend nadeko-cl2 https://inv-cl2.nadeko.net {
-            penalty 0.5
+            penalty 0
         }
 
         backend cho-comp2 https://yt-comp2.chocolatemoo53.com {
-            penalty 0.5
+            penalty 0
         }
 
         backend cho-comp4 https://eu.yt-comp4.chocolatemoo53.com {
-            penalty 0.5
+            penalty 0
         }
 
         backend nerdvpn https://invidious.nerdvpn.de {
-            penalty 0.5
+            penalty 0
         }
         
-        backend nadeko-de2 https://inv-de2.nadeko.net {
-            penalty 0.5
+        backend cho-comp6 https://eu.yt-comp6.chocolatemoo53.com/ {
+            penalty 0
         }
 
         circuit_breaker {

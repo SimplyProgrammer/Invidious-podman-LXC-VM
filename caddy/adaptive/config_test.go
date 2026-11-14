@@ -122,3 +122,42 @@ adaptive_proxy {
 		t.Fatalf("backend penalty=%v; want 0.5", h.Backends[0].Penalty)
 	}
 }
+
+func TestRetryDefaultsAndCaddyfileOptions(t *testing.T) {
+	h := &Handler{Backends: []BackendConfig{{Name: "local", URL: "http://127.0.0.1:3000"}}}
+	h.applyDefaults()
+	if !h.MaxAttemptsAuto {
+		t.Fatal("default max_attempts should be auto")
+	}
+	if h.PassThroughLastError == nil || !*h.PassThroughLastError {
+		t.Fatal("pass_through_last_error should default to true")
+	}
+
+	d := caddyfile.NewTestDispenser(`adaptive_proxy {
+		max_attempts 4
+		pass_through_last_error false
+		backend local http://127.0.0.1:3000
+	}`)
+	parsed := new(Handler)
+	if err := parsed.UnmarshalCaddyfile(d); err != nil {
+		t.Fatal(err)
+	}
+	if parsed.MaxAttemptsAuto || *parsed.MaxAttempts != 4 {
+		t.Fatalf("numeric max_attempts parsed incorrectly: auto=%v count=%d", parsed.MaxAttemptsAuto, *parsed.MaxAttempts)
+	}
+	if *parsed.PassThroughLastError {
+		t.Fatal("pass_through_last_error false was not parsed")
+	}
+
+	d = caddyfile.NewTestDispenser(`adaptive_proxy {
+		max_attempts auto
+		backend local http://127.0.0.1:3000
+	}`)
+	parsed = new(Handler)
+	if err := parsed.UnmarshalCaddyfile(d); err != nil {
+		t.Fatal(err)
+	}
+	if !parsed.MaxAttemptsAuto {
+		t.Fatal("max_attempts auto was not parsed")
+	}
+}
