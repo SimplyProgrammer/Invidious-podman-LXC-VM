@@ -146,7 +146,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 	excluded := make(map[string]struct{}, maxAttempts)
 	var autoCandidates []BackendSnapshot
 	var lastErr error
+	var lastHTTPResponse *http.Response
 	attemptsMade := 0
+	defer func() {
+		if lastHTTPResponse != nil {
+			closeAndDrain(lastHTTPResponse.Body)
+		}
+	}()
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if r.Context().Err() != nil {
@@ -253,7 +259,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 					h.breaker.RecordFailure(backend.Name, time.Now())
 				}
 				h.metrics.recordRetry(backend.Name)
-				closeAndDrain(resp.Body)
+				// Keep the most recent actual HTTP error response available as
+				// a fallback in case a later backend fails before returning HTTP.
+				if lastHTTPResponse != nil {
+					closeAndDrain(lastHTTPResponse.Body)
+				}
+				lastHTTPResponse = resp
 				continue
 			}
 		}
@@ -287,6 +298,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 			}
 		}
 
+		// A current HTTP response takes precedence over any earlier saved
+		// retryable response, whether it is retryable or not.
+		if lastHTTPResponse != nil {
+			closeAndDrain(lastHTTPResponse.Body)
+			lastHTTPResponse = nil
+		}
 		if h.Headers != nil && h.Headers.Response != nil && h.Headers.Response.HeaderOps != nil {
 			h.Headers.Response.ApplyTo(resp.Header, replacerForRequest(r))
 		}
@@ -353,6 +370,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 
 	if r.Context().Err() != nil {
 		outcome = "client_cancellation"
+		return nil
+	}
+	// If the final attempt(s) failed before producing an HTTP response, prefer
+	// the most recent actual retryable HTTP response over a synthetic 502.
+	// This applies equally to fixed and automatic attempt limits.
+	if lastHTTPResponse != nil && (h.PassThroughLastError == nil || *h.PassThroughLastError) {
+		if h.Headers != nil && h.Headers.Response != nil && h.Headers.Response.HeaderOps != nil {
+			h.Headers.Response.ApplyTo(lastHTTPResponse.Header, replacerForRequest(r))
+		}
+		copyResponseHeaders(w.Header(), lastHTTPResponse.Header)
+		w.WriteHeader(lastHTTPResponse.StatusCode)
+		_, copyErr := io.Copy(w, lastHTTPResponse.Body)
+		_ = lastHTTPResponse.Body.Close()
+		lastHTTPResponse = nil
+		if copyErr != nil && r.Context().Err() == nil && !isClientCancellation(copyErr) {
+			outcome = "exhausted_retries"
+			return fmt.Errorf("streaming saved upstream error response: %w", copyErr)
+		}
+		outcome = "exhausted_retries"
 		return nil
 	}
 	if lastErr == nil {

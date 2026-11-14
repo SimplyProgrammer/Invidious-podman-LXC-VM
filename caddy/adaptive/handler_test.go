@@ -561,3 +561,130 @@ func TestPassThroughLastErrorCanBeDisabled(t *testing.T) {
 		t.Fatalf("got %d %q; want synthetic 502", rr.Code, rr.Body.String())
 	}
 }
+
+func TestPassThroughMostRecentHTTPResponseAfterLaterDisconnect(t *testing.T) {
+	for _, mode := range []struct {
+		name     string
+		auto     bool
+		attempts int
+	}{
+		{name: "fixed_attempts", attempts: 3},
+		{name: "automatic_attempts", auto: true, attempts: 3},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			var sequence atomic.Int64
+			var servers []*httptest.Server
+			var backends []BackendConfig
+			for i := 0; i < 3; i++ {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					switch sequence.Add(1) {
+					case 1:
+						w.Header().Set("X-Upstream-Response", "first")
+						w.WriteHeader(http.StatusInternalServerError)
+						_, _ = io.WriteString(w, "first-upstream-error")
+					case 2:
+						w.Header().Set("X-Upstream-Response", "second")
+						w.Header().Set("Content-Type", "text/plain")
+						w.WriteHeader(http.StatusServiceUnavailable)
+						_, _ = io.WriteString(w, "second-upstream-error")
+					default:
+						hijacker, ok := w.(http.Hijacker)
+						if !ok {
+							t.Error("ResponseWriter does not support hijacking")
+							return
+						}
+						conn, _, err := hijacker.Hijack()
+						if err != nil {
+							t.Errorf("hijack: %v", err)
+							return
+						}
+						_ = conn.Close()
+					}
+				}))
+				servers = append(servers, server)
+				backends = append(backends, BackendConfig{Name: fmt.Sprintf("backend-%d", i), URL: server.URL})
+			}
+			defer func() {
+				for _, server := range servers {
+					server.Close()
+				}
+			}()
+
+			h := &Handler{
+				Backends:         backends,
+				MaxAttempts:      intPtr(mode.attempts),
+				MaxAttemptsAuto:  mode.auto,
+				RetryStatusCodes: []int{http.StatusInternalServerError, http.StatusServiceUnavailable},
+			}
+			h.applyDefaults()
+			if err := h.Provision(caddy.Context{}); err != nil {
+				t.Fatalf("Provision: %v", err)
+			}
+			defer h.Cleanup()
+
+			rr := httptest.NewRecorder()
+			if err := h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "http://invidious.test/video", nil), nil); err != nil {
+				t.Fatalf("ServeHTTP: %v", err)
+			}
+			if got := sequence.Load(); got != 3 {
+				t.Fatalf("upstream attempts=%d; want 3", got)
+			}
+			if rr.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d; want saved upstream 503", rr.Code)
+			}
+			if got := rr.Header().Get("X-Upstream-Response"); got != "second" {
+				t.Fatalf("X-Upstream-Response=%q; want second", got)
+			}
+			if got := rr.Body.String(); got != "second-upstream-error" {
+				t.Fatalf("body=%q; want most recent upstream response", got)
+			}
+		})
+	}
+}
+
+func TestAllUpstreamsDisconnectStillReturns502(t *testing.T) {
+	var calls atomic.Int64
+	var servers []*httptest.Server
+	var backends []BackendConfig
+	for i := 0; i < 2; i++ {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("ResponseWriter does not support hijacking")
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			_ = conn.Close()
+		}))
+		servers = append(servers, server)
+		backends = append(backends, BackendConfig{Name: fmt.Sprintf("disconnect-%d", i), URL: server.URL})
+	}
+	defer func() {
+		for _, server := range servers {
+			server.Close()
+		}
+	}()
+
+	h := &Handler{Backends: backends, MaxAttemptsAuto: true}
+	h.applyDefaults()
+	if err := h.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	defer h.Cleanup()
+
+	rr := httptest.NewRecorder()
+	if err := h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "http://invidious.test/video", nil), nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("upstream attempts=%d; want 2", got)
+	}
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d; want synthetic 502", rr.Code)
+	}
+}
