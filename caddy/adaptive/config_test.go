@@ -161,3 +161,28 @@ func TestRetryDefaultsAndCaddyfileOptions(t *testing.T) {
 		t.Fatal("max_attempts auto was not parsed")
 	}
 }
+
+func TestMaxTimeToResponseDefaultAndCaddyfileOption(t *testing.T) {
+	h := &Handler{Backends: []BackendConfig{{Name: "local", URL: "http://127.0.0.1:3000"}}}
+	h.applyDefaults()
+	if got := time.Duration(*h.MaxTimeToResponse); got != 7*time.Second {
+		t.Fatalf("default max_time_to_response=%s; want 7s", got)
+	}
+
+	for _, test := range []struct {
+		value string
+		want  time.Duration
+	}{
+		{value: "3s", want: 3 * time.Second},
+		{value: "0s", want: 0},
+	} {
+		d := caddyfile.NewTestDispenser("adaptive_proxy {\n max_time_to_response " + test.value + "\n backend local http://127.0.0.1:3000\n}")
+		parsed := new(Handler)
+		if err := parsed.UnmarshalCaddyfile(d); err != nil {
+			t.Fatalf("parse %q: %v", test.value, err)
+		}
+		if got := time.Duration(*parsed.MaxTimeToResponse); got != test.want {
+			t.Errorf("max_time_to_response %q=%s; want %s", test.value, got, test.want)
+		}
+	}
+}

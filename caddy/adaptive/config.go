@@ -110,6 +110,10 @@ func (h *Handler) applyDefaults() {
 		h.MaxAttempts = intPtr(3)
 		h.MaxAttemptsAuto = true
 	}
+	if h.MaxTimeToResponse == nil {
+		d := caddy.Duration(7 * time.Second)
+		h.MaxTimeToResponse = &d
+	}
 	if h.PassThroughLastError == nil {
 		h.PassThroughLastError = boolPtr(true)
 	}
@@ -181,6 +185,7 @@ func boolPtr(v bool) *bool { return &v }
 //	    recovery_interval 10m
 //	    recovery_amount 1
 //	    max_attempts auto
+//	    max_time_to_response 14s // 0s disables speculative racing
 //	    pass_through_last_error true
 //	    # max_penalty omitted means unlimited
 //	    retry_status_codes 401-403 405-499 500-599
@@ -275,6 +280,14 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return err
 			}
 			h.RecoveryAmount = floatPtr(value)
+
+		case "max_time_to_response":
+			value, err := durationArg(d)
+			if err != nil {
+				return err
+			}
+			duration := caddy.Duration(value)
+			h.MaxTimeToResponse = &duration
 
 		case "max_attempts":
 			raw, err := oneArg(d)
@@ -605,6 +618,9 @@ func (h *Handler) validate() error {
 	}
 	if h.MaxAttempts == nil || *h.MaxAttempts < 1 {
 		return fmt.Errorf("max_attempts must be at least 1")
+	}
+	if h.MaxTimeToResponse == nil || *h.MaxTimeToResponse < 0 {
+		return fmt.Errorf("max_time_to_response must be zero (disabled) or greater")
 	}
 	if h.MaxPenalty != nil && !validPenalty(*h.MaxPenalty) {
 		return fmt.Errorf("max_penalty must be a finite non-negative number")

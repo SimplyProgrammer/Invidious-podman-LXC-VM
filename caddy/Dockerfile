@@ -6,9 +6,11 @@ WORKDIR /src
 
 COPY adaptive/ ./adaptive/
 
-RUN --network=host xcaddy build \
-    --with github.com/local/caddy-adaptive=./adaptive \
-    --output /usr/bin/caddy
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    --network=host xcaddy build \
+      --with github.com/local/caddy-adaptive=./adaptive \
+      --output /usr/bin/caddy
 
 FROM docker.io/library/caddy:${CADDY_VERSION}
 

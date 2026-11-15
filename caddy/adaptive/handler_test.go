@@ -688,3 +688,216 @@ func TestAllUpstreamsDisconnectStillReturns502(t *testing.T) {
 		t.Fatalf("status=%d; want synthetic 502", rr.Code)
 	}
 }
+
+func TestAdaptiveProxyStartsSpeculativeAttemptAfterTTFBThreshold(t *testing.T) {
+	var slowCalls atomic.Int64
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slowCalls.Add(1)
+		time.Sleep(180 * time.Millisecond)
+		_, _ = io.WriteString(w, "slow")
+	}))
+	defer slow.Close()
+	var fastCalls atomic.Int64
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fastCalls.Add(1)
+		_, _ = io.WriteString(w, "fast")
+	}))
+	defer fast.Close()
+
+	h := newTestHandler(t, []BackendConfig{
+		{Name: "slow", URL: slow.URL, Penalty: 0},
+		{Name: "fast", URL: fast.URL, Penalty: 1_000_000_000},
+	}, 2, nil)
+	threshold := caddy.Duration(40 * time.Millisecond)
+	h.MaxTimeToResponse = &threshold
+
+	req := httptest.NewRequest(http.MethodGet, "http://invidious.test/video", nil)
+	rr := httptest.NewRecorder()
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if rr.Code != http.StatusOK || rr.Body.String() != "fast" {
+		t.Fatalf("got status=%d body=%q; want fast winner", rr.Code, rr.Body.String())
+	}
+	if slowCalls.Load() != 1 || fastCalls.Load() != 1 {
+		t.Fatalf("upstream calls slow=%d fast=%d; want one each", slowCalls.Load(), fastCalls.Load())
+	}
+	// The slower loser must be allowed to finish after the client response
+	// has been selected and must still be included in backend metrics.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		metrics, _ := h.metrics.Snapshot()
+		var slowRecorded bool
+		for _, item := range metrics {
+			if item.Name == "slow" && item.Requests == 1 && item.Successes == 1 {
+				slowRecorded = true
+			}
+		}
+		if slowRecorded {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("slow losing attempt was not scored after completion")
+}
+
+func TestAdaptiveProxyZeroMaxTimeToResponseKeepsSequentialBehavior(t *testing.T) {
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(80 * time.Millisecond)
+		_, _ = io.WriteString(w, "first")
+	}))
+	defer first.Close()
+	var secondCalls atomic.Int64
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondCalls.Add(1)
+		_, _ = io.WriteString(w, "second")
+	}))
+	defer second.Close()
+
+	h := newTestHandler(t, []BackendConfig{
+		{Name: "first", URL: first.URL, Penalty: 0},
+		{Name: "second", URL: second.URL, Penalty: 1_000_000_000},
+	}, 2, nil)
+	disabled := caddy.Duration(0)
+	h.MaxTimeToResponse = &disabled
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://invidious.test/video", nil)
+	if err := h.ServeHTTP(rr, req, nil); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
+	if rr.Code != http.StatusOK || rr.Body.String() != "first" {
+		t.Fatalf("got status=%d body=%q; want first response", rr.Code, rr.Body.String())
+	}
+	if secondCalls.Load() != 0 {
+		t.Fatalf("second backend called %d times; want no speculative attempt", secondCalls.Load())
+	}
+}
+
+func TestAdaptiveProxyRaceWinnerBodySurvivesSelectionWithoutLosers(t *testing.T) {
+	bodyRelease := make(chan struct{})
+	headersFlushed := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		close(headersFlushed)
+		<-bodyRelease
+		_, _ = io.WriteString(w, "complete-video-body")
+	}))
+	defer upstream.Close()
+
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("second backend must not be launched before the TTFB threshold")
+		_, _ = io.WriteString(w, "unexpected")
+	}))
+	defer other.Close()
+
+	h := newTestHandler(t, []BackendConfig{
+		{Name: "winner", URL: upstream.URL, Penalty: 0},
+		{Name: "other", URL: other.URL, Penalty: 1_000_000_000},
+	}, 2, nil)
+	threshold := caddy.Duration(time.Second)
+	h.MaxTimeToResponse = &threshold
+
+	rr := httptest.NewRecorder()
+	done := make(chan error, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "http://invidious.test/videoplayback", nil)
+		done <- h.ServeHTTP(rr, req, nil)
+	}()
+
+	select {
+	case <-headersFlushed:
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not flush response headers")
+	}
+	// Let the proxy select the winner while its body is deliberately still
+	// blocked. The winning attempt context must remain alive during streaming.
+	close(bodyRelease)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ServeHTTP: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ServeHTTP did not finish")
+	}
+	if rr.Code != http.StatusOK || rr.Body.String() != "complete-video-body" {
+		t.Fatalf("winner response was truncated: status=%d body=%q", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAdaptiveProxyRaceLoserCompletionDoesNotCancelWinnerStream(t *testing.T) {
+	winnerBodyRelease := make(chan struct{})
+	winnerHeaders := make(chan struct{})
+	winnerContextCanceled := make(chan struct{})
+	winner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		close(winnerHeaders)
+		select {
+		case <-winnerBodyRelease:
+			_, _ = io.WriteString(w, "winner-stream-complete")
+		case <-r.Context().Done():
+			close(winnerContextCanceled)
+		}
+	}))
+	defer winner.Close()
+
+	loserFinished := make(chan struct{})
+	loser := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(120 * time.Millisecond)
+		_, _ = io.WriteString(w, "loser")
+		close(loserFinished)
+	}))
+	defer loser.Close()
+
+	// The slow-TTFB backend is selected first. The winner is launched only
+	// after the threshold, while the first attempt remains in flight.
+	h := newTestHandler(t, []BackendConfig{
+		{Name: "loser", URL: loser.URL, Penalty: 0},
+		{Name: "winner", URL: winner.URL, Penalty: 1_000_000_000},
+	}, 2, nil)
+	threshold := caddy.Duration(25 * time.Millisecond)
+	h.MaxTimeToResponse = &threshold
+
+	rr := httptest.NewRecorder()
+	done := make(chan error, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "http://invidious.test/videoplayback", nil)
+		done <- h.ServeHTTP(rr, req, nil)
+	}()
+
+	select {
+	case <-winnerHeaders:
+	case <-time.After(time.Second):
+		t.Fatal("winner did not send headers")
+	}
+	select {
+	case <-loserFinished:
+	case <-time.After(time.Second):
+		t.Fatal("losing attempt did not finish")
+	}
+	// Give the loser collector time to finish reading and clean up its
+	// response. Its cancellation must remain scoped to the losing attempt.
+	time.Sleep(80 * time.Millisecond)
+	select {
+	case <-winnerContextCanceled:
+		t.Fatal("finishing the loser cancelled the winner's streaming request")
+	default:
+	}
+	close(winnerBodyRelease)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ServeHTTP: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ServeHTTP did not finish")
+	}
+	if rr.Code != http.StatusOK || rr.Body.String() != "winner-stream-complete" {
+		t.Fatalf("winner response was truncated: status=%d body=%q", rr.Code, rr.Body.String())
+	}
+}

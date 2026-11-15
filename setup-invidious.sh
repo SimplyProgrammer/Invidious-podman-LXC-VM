@@ -205,6 +205,8 @@ EOF
 systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}.service"
 
+podman image prune -f
+
 echo
 echo "==== Setup Complete ===="
 echo "Access via: https://<your-domain> (default: https://invidious.home.arpa)"

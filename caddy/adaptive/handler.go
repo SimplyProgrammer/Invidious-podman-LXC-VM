@@ -41,6 +41,7 @@ type Handler struct {
 	RecoveryInterval     caddy.Duration        `json:"recovery_interval,omitempty"`
 	RecoveryAmount       *float64              `json:"recovery_amount,omitempty"`
 	MaxAttempts          *int                  `json:"max_attempts,omitempty"`
+	MaxTimeToResponse    *caddy.Duration       `json:"max_time_to_response,omitempty"`
 	MaxAttemptsAuto      bool                  `json:"max_attempts_auto,omitempty"`
 	PassThroughLastError *bool                 `json:"pass_through_last_error,omitempty"`
 	MaxPenalty           *float64              `json:"max_penalty,omitempty"`
@@ -141,6 +142,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 	// is normally GET/HEAD, but this keeps the middleware safe for other methods.
 	if requestHasBody(r) && r.GetBody == nil {
 		maxAttempts = 1
+	}
+
+	// Keep the established sequential path completely unchanged when racing
+	// is disabled, only one attempt is permitted, or the request has a body.
+	// Parallel replay is currently limited to bodyless requests (the normal
+	// Invidious playback path) so request entities are never duplicated.
+	if h.MaxTimeToResponse != nil && time.Duration(*h.MaxTimeToResponse) > 0 &&
+		maxAttempts > 1 && !requestHasBody(r) {
+		return h.serveRaced(w, r, maxAttempts, &outcome)
 	}
 
 	excluded := make(map[string]struct{}, maxAttempts)

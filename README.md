@@ -53,7 +53,7 @@ podman exec "$(podman ps -q --filter name=caddy | head -n1)" caddy adapt --confi
 
 Show caddy adaptive_proxy `/_adaptive/status` when enabled (need format):
 ```sh
-podman exec "$(podman ps -q --filter name=caddy | head -n1)" curl -sk --resolve ivds.home.arpa:443:127.0.0.1 https://ivds.home.arpa/_adaptive/status
+podman exec "$(podman ps -q --filter name=caddy | head -n1)" curl -sk --resolve <YOUR_INVIDIOUS_DOMAIN>:443:127.0.0.1 https://<YOUR_INVIDIOUS_DOMAIN>/_adaptive/status
 ```
 
 # Notice
@@ -64,3 +64,5 @@ Also, feel free to modify the `compose.yml` file when you know what you are doin
 If you find this helpful, it would be great if you could start the repo and spread the word.
 
 If you encounter any issues or have ideas for improvements (more efficient approaches, alternative methods, or new features), feel free to open an issue. Contributions via pull requests would be appreciated.
+
+This project contains LLM generated code.

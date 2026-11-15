@@ -13,4 +13,4 @@ if [ ! -f .env ]; then
     chmod 600 .env
 fi
 
-exec podman-compose up -d
+exec podman-compose up -d --build

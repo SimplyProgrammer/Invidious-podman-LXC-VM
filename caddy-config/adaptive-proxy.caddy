@@ -4,6 +4,7 @@ handle @adaptive_paths {
     adaptive_proxy {
         selection adaptive_weighted_random
 
+        max_time_to_response 7s
         latency_threshold 4s
         latency_penalty 1x
         error_penalty 2

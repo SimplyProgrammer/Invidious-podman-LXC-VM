@@ -11,7 +11,7 @@ if [ "$response" = "y" ] || [ "$response" = "yes" ]; then
 
     git -C ./invidious pull
     podman-compose pull
-    podman-compose up -d
+    podman-compose up -d --build
     podman image prune -f
 else
     echo "Update cancelled."
