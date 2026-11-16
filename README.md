@@ -51,7 +51,7 @@ Print running caddy config:
 podman exec "$(podman ps -q --filter name=caddy | head -n1)" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile --pretty
 ```
 
-Show caddy adaptive_proxy `/_adaptive/status` when enabled (need format):
+Show caddy adaptive_proxy `/_adaptive/status` when enabled (needs formatting):
 ```sh
 podman exec "$(podman ps -q --filter name=caddy | head -n1)" curl -sk --resolve <YOUR_INVIDIOUS_DOMAIN>:443:127.0.0.1 https://<YOUR_INVIDIOUS_DOMAIN>/_adaptive/status
 ```
@@ -69,4 +69,4 @@ If you find this helpful, it would be great if you could start the repo and spre
 
 If you encounter any issues or have ideas for improvements (more efficient approaches, alternative methods, or new features), feel free to open an issue. Contributions via pull requests would be appreciated.
 
-This project contains LLM generated code.
+This project may contain LLM generated code.
