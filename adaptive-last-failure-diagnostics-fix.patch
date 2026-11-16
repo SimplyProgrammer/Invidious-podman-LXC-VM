@@ -1,0 +1,187 @@
+diff --git a/adaptive/failure_body.go b/adaptive/failure_body.go
+index 455df9c..2a21c1c 100644
+--- a/adaptive/failure_body.go
++++ b/adaptive/failure_body.go
+@@ -25,17 +25,17 @@ func (b *failureCaptureBody) Read(p []byte) (int, error) {
+ 	if n > 0 {
+ 		readN := n
+ 		b.mu.Lock()
+-		if len(b.buf) < 2048 {
+-			remaining := 2048 - len(b.buf)
++		if len(b.buf) < 4096 {
++			remaining := 4096 - len(b.buf)
+ 			if readN > remaining {
+ 				readN = remaining
+ 			}
+ 			b.buf = append(b.buf, p[:readN]...)
+ 		}
+ 		text := strings.ToValidUTF8(string(b.buf), "�")
+-		if utf8.RuneCountInString(text) > 512 {
++		if utf8.RuneCountInString(text) > 1024 {
+ 			runes := []rune(text)
+-			text = string(runes[:512])
++			text = string(runes[:1024])
+ 		}
+ 		update := b.update
+ 		b.mu.Unlock()
+@@ -45,3 +45,13 @@ func (b *failureCaptureBody) Read(p []byte) (int, error) {
+ 	}
+ 	return n, err
+ }
++
++// truncateFailureDiagnostic limits retained diagnostic text by Unicode characters.
++func truncateFailureDiagnostic(value string) string {
++	value = strings.ToValidUTF8(value, "�")
++	runes := []rune(value)
++	if len(runes) > 1024 {
++		return string(runes[:1024])
++	}
++	return value
++}
+diff --git a/adaptive/failure_body_test.go b/adaptive/failure_body_test.go
+index 4db6432..73a2a25 100644
+--- a/adaptive/failure_body_test.go
++++ b/adaptive/failure_body_test.go
+@@ -7,7 +7,7 @@ import (
+ )
+ 
+ func TestFailureCaptureBodyCapturesWithoutChangingStream(t *testing.T) {
+-	original := strings.Repeat("é", 600)
++	original := strings.Repeat("é", 1200)
+ 	var captured string
+ 	body := newFailureCaptureBody(io.NopCloser(strings.NewReader(original)), func(value string) {
+ 		captured = value
+@@ -19,10 +19,21 @@ func TestFailureCaptureBodyCapturesWithoutChangingStream(t *testing.T) {
+ 	if string(read) != original {
+ 		t.Fatal("wrapped body changed the response stream")
+ 	}
+-	if got := len([]rune(captured)); got != 512 {
+-		t.Fatalf("captured %d characters, want 512", got)
++	if got := len([]rune(captured)); got != 1024 {
++		t.Fatalf("captured %d characters, want 1024", got)
+ 	}
+-	if captured != strings.Repeat("é", 512) {
++	if captured != strings.Repeat("é", 1024) {
+ 		t.Fatal("captured response does not contain the expected prefix")
+ 	}
+ }
++
++func TestTruncateFailureDiagnostic(t *testing.T) {
++	input := strings.Repeat("x", 1100)
++	got := truncateFailureDiagnostic(input)
++	if len([]rune(got)) != 1024 {
++		t.Fatalf("got %d characters, want 1024", len([]rune(got)))
++	}
++	if got != strings.Repeat("x", 1024) {
++		t.Fatal("transport diagnostic was not truncated to the expected prefix")
++	}
++}
+diff --git a/adaptive/handler.go b/adaptive/handler.go
+index 96fa788..9dd3130 100644
+--- a/adaptive/handler.go
++++ b/adaptive/handler.go
+@@ -206,7 +206,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
+ 		outReq, err := h.outboundRequest(r, backend, attempt > 0)
+ 		if err != nil {
+ 			lastErr = err
+-			h.recordBackendFailure(backend.Name, 0, 0, false)
++			h.recordBackendFailure(backend.Name, 0, 0, false, err)
+ 			willRetry := attempt+1 < maxAttempts
+ 			if h.MaxAttemptsAuto {
+ 				autoCandidates = h.autoRetryCandidates(excluded)
+@@ -227,7 +227,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
+ 				return nil
+ 			}
+ 			lastErr = roundTripErr
+-			h.recordBackendFailure(backend.Name, time.Since(started), 0, false)
++			h.recordBackendFailure(backend.Name, time.Since(started), 0, false, roundTripErr)
+ 			willRetry := attempt+1 < maxAttempts
+ 			if h.MaxAttemptsAuto {
+ 				autoCandidates = h.autoRetryCandidates(excluded)
+@@ -241,7 +241,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
+ 
+ 		if resp == nil {
+ 			lastErr = errors.New("upstream returned an empty response")
+-			h.recordBackendFailure(backend.Name, time.Since(started), 0, false)
++			h.recordBackendFailure(backend.Name, time.Since(started), 0, false, lastErr)
+ 			willRetry := attempt+1 < maxAttempts
+ 			if h.MaxAttemptsAuto {
+ 				autoCandidates = h.autoRetryCandidates(excluded)
+@@ -336,7 +336,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
+ 				if statusFailure {
+ 					h.recordHTTPBackendFailure(backend.Name, duration, uint64(bytesWritten), false, resp.StatusCode, ttfb, transferDuration)
+ 				} else {
+-					h.recordBackendFailure(backend.Name, duration, uint64(bytesWritten), false)
++					h.recordBackendFailure(backend.Name, duration, uint64(bytesWritten), false, copyErr)
+ 				}
+ 				if statusFailure && h.breaker != nil {
+ 					h.breaker.RecordFailure(backend.Name, time.Now())
+@@ -446,10 +446,14 @@ func (h *Handler) autoRetryCandidates(excluded map[string]struct{}) []BackendSna
+ 
+ // recordBackendFailure applies the configured penalty, updates the circuit
+ // breaker, and records one failed upstream attempt.
+-func (h *Handler) recordBackendFailure(name string, duration time.Duration, bytes uint64, slow bool) {
++func (h *Handler) recordBackendFailure(name string, duration time.Duration, bytes uint64, slow bool, failureErr error) {
+ 	h.penalize(name, *h.ErrorPenalty)
+ 	h.metrics.recordFailure(name, duration, bytes, slow)
+-	h.metrics.setFailureDiagnostic(name, -1, "")
++	message := "Upstream connection failed"
++	if failureErr != nil && failureErr.Error() != "" {
++		message = failureErr.Error()
++	}
++	h.metrics.setFailureDiagnostic(name, -1, truncateFailureDiagnostic(message))
+ 	if h.breaker != nil {
+ 		h.breaker.RecordFailure(name, time.Now())
+ 	}
+diff --git a/adaptive/race.go b/adaptive/race.go
+index ecaa29d..39f7e16 100644
+--- a/adaptive/race.go
++++ b/adaptive/race.go
+@@ -2,6 +2,7 @@ package adaptive
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+@@ -212,7 +213,7 @@ func (h *Handler) serveRaced(w http.ResponseWriter, r *http.Request, maxAttempts
+ 					if result.err == nil {
+ 						result.err = fmt.Errorf("upstream returned an empty response")
+ 					}
+-					h.recordBackendFailure(result.backend.Name, time.Since(result.started), 0, false)
++					h.recordBackendFailure(result.backend.Name, time.Since(result.started), 0, false, result.err)
+ 					launchNext(result.backend.Name)
+ 				}
+ 				continue
+@@ -336,7 +337,7 @@ func (h *Handler) writeRaceWinner(w http.ResponseWriter, r *http.Request, result
+ 	}
+ 	if copyErr != nil {
+ 		if tracked.writeErr == nil && r.Context().Err() == nil && !isClientCancellation(copyErr) {
+-			h.recordBackendFailure(result.backend.Name, duration, uint64(bytesWritten), false)
++			h.recordBackendFailure(result.backend.Name, duration, uint64(bytesWritten), false, copyErr)
+ 			*outcome = "interrupted_transfer"
+ 			return fmt.Errorf("streaming response from backend %q: %w", result.backend.Name, copyErr)
+ 		}
+@@ -390,7 +391,11 @@ func (h *Handler) scoreRaceLoser(result raceResult) {
+ 			h.metrics.recordCancellation(result.backend.Name)
+ 			return
+ 		}
+-		h.recordBackendFailure(result.backend.Name, time.Since(result.started), 0, false)
++		failureErr := result.err
++		if failureErr == nil {
++			failureErr = errors.New("upstream returned an empty response")
++		}
++		h.recordBackendFailure(result.backend.Name, time.Since(result.started), 0, false, failureErr)
+ 		return
+ 	}
+ 	resp := result.resp
+@@ -418,7 +423,7 @@ func (h *Handler) scoreRaceLoser(result raceResult) {
+ 		transfer = 0
+ 	}
+ 	if copyErr != nil {
+-		h.recordBackendFailure(result.backend.Name, duration, uint64(bytesRead), false)
++		h.recordBackendFailure(result.backend.Name, duration, uint64(bytesRead), false, copyErr)
+ 		return
+ 	}
+ 	slow := duration > time.Duration(h.LatencyThreshold)

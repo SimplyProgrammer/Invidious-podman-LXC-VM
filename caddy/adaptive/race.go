@@ -2,6 +2,7 @@ package adaptive
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -212,7 +213,7 @@ func (h *Handler) serveRaced(w http.ResponseWriter, r *http.Request, maxAttempts
 					if result.err == nil {
 						result.err = fmt.Errorf("upstream returned an empty response")
 					}
-					h.recordBackendFailure(result.backend.Name, time.Since(result.started), 0, false)
+					h.recordBackendFailure(result.backend.Name, time.Since(result.started), 0, false, result.err)
 					launchNext(result.backend.Name)
 				}
 				continue
@@ -336,7 +337,7 @@ func (h *Handler) writeRaceWinner(w http.ResponseWriter, r *http.Request, result
 	}
 	if copyErr != nil {
 		if tracked.writeErr == nil && r.Context().Err() == nil && !isClientCancellation(copyErr) {
-			h.recordBackendFailure(result.backend.Name, duration, uint64(bytesWritten), false)
+			h.recordBackendFailure(result.backend.Name, duration, uint64(bytesWritten), false, copyErr)
 			*outcome = "interrupted_transfer"
 			return fmt.Errorf("streaming response from backend %q: %w", result.backend.Name, copyErr)
 		}
@@ -390,7 +391,11 @@ func (h *Handler) scoreRaceLoser(result raceResult) {
 			h.metrics.recordCancellation(result.backend.Name)
 			return
 		}
-		h.recordBackendFailure(result.backend.Name, time.Since(result.started), 0, false)
+		failureErr := result.err
+		if failureErr == nil {
+			failureErr = errors.New("upstream returned an empty response")
+		}
+		h.recordBackendFailure(result.backend.Name, time.Since(result.started), 0, false, failureErr)
 		return
 	}
 	resp := result.resp
@@ -418,7 +423,7 @@ func (h *Handler) scoreRaceLoser(result raceResult) {
 		transfer = 0
 	}
 	if copyErr != nil {
-		h.recordBackendFailure(result.backend.Name, duration, uint64(bytesRead), false)
+		h.recordBackendFailure(result.backend.Name, duration, uint64(bytesRead), false, copyErr)
 		return
 	}
 	slow := duration > time.Duration(h.LatencyThreshold)

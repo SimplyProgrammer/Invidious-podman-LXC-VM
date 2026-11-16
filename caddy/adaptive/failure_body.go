@@ -25,17 +25,17 @@ func (b *failureCaptureBody) Read(p []byte) (int, error) {
 	if n > 0 {
 		readN := n
 		b.mu.Lock()
-		if len(b.buf) < 2048 {
-			remaining := 2048 - len(b.buf)
+		if len(b.buf) < 4096 {
+			remaining := 4096 - len(b.buf)
 			if readN > remaining {
 				readN = remaining
 			}
 			b.buf = append(b.buf, p[:readN]...)
 		}
 		text := strings.ToValidUTF8(string(b.buf), "�")
-		if utf8.RuneCountInString(text) > 512 {
+		if utf8.RuneCountInString(text) > 1024 {
 			runes := []rune(text)
-			text = string(runes[:512])
+			text = string(runes[:1024])
 		}
 		update := b.update
 		b.mu.Unlock()
@@ -44,4 +44,14 @@ func (b *failureCaptureBody) Read(p []byte) (int, error) {
 		}
 	}
 	return n, err
+}
+
+// truncateFailureDiagnostic limits retained diagnostic text by Unicode characters.
+func truncateFailureDiagnostic(value string) string {
+	value = strings.ToValidUTF8(value, "�")
+	runes := []rune(value)
+	if len(runes) > 1024 {
+		return string(runes[:1024])
+	}
+	return value
 }

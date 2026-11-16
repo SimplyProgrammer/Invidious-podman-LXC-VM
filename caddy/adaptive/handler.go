@@ -206,7 +206,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 		outReq, err := h.outboundRequest(r, backend, attempt > 0)
 		if err != nil {
 			lastErr = err
-			h.recordBackendFailure(backend.Name, 0, 0, false)
+			h.recordBackendFailure(backend.Name, 0, 0, false, err)
 			willRetry := attempt+1 < maxAttempts
 			if h.MaxAttemptsAuto {
 				autoCandidates = h.autoRetryCandidates(excluded)
@@ -227,7 +227,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 				return nil
 			}
 			lastErr = roundTripErr
-			h.recordBackendFailure(backend.Name, time.Since(started), 0, false)
+			h.recordBackendFailure(backend.Name, time.Since(started), 0, false, roundTripErr)
 			willRetry := attempt+1 < maxAttempts
 			if h.MaxAttemptsAuto {
 				autoCandidates = h.autoRetryCandidates(excluded)
@@ -241,7 +241,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 
 		if resp == nil {
 			lastErr = errors.New("upstream returned an empty response")
-			h.recordBackendFailure(backend.Name, time.Since(started), 0, false)
+			h.recordBackendFailure(backend.Name, time.Since(started), 0, false, lastErr)
 			willRetry := attempt+1 < maxAttempts
 			if h.MaxAttemptsAuto {
 				autoCandidates = h.autoRetryCandidates(excluded)
@@ -336,7 +336,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 				if statusFailure {
 					h.recordHTTPBackendFailure(backend.Name, duration, uint64(bytesWritten), false, resp.StatusCode, ttfb, transferDuration)
 				} else {
-					h.recordBackendFailure(backend.Name, duration, uint64(bytesWritten), false)
+					h.recordBackendFailure(backend.Name, duration, uint64(bytesWritten), false, copyErr)
 				}
 				if statusFailure && h.breaker != nil {
 					h.breaker.RecordFailure(backend.Name, time.Now())
@@ -446,10 +446,14 @@ func (h *Handler) autoRetryCandidates(excluded map[string]struct{}) []BackendSna
 
 // recordBackendFailure applies the configured penalty, updates the circuit
 // breaker, and records one failed upstream attempt.
-func (h *Handler) recordBackendFailure(name string, duration time.Duration, bytes uint64, slow bool) {
+func (h *Handler) recordBackendFailure(name string, duration time.Duration, bytes uint64, slow bool, failureErr error) {
 	h.penalize(name, *h.ErrorPenalty)
 	h.metrics.recordFailure(name, duration, bytes, slow)
-	h.metrics.setFailureDiagnostic(name, -1, "")
+	message := "Upstream connection failed"
+	if failureErr != nil && failureErr.Error() != "" {
+		message = failureErr.Error()
+	}
+	h.metrics.setFailureDiagnostic(name, -1, truncateFailureDiagnostic(message))
 	if h.breaker != nil {
 		h.breaker.RecordFailure(name, time.Now())
 	}
