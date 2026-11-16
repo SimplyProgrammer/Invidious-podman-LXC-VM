@@ -3,6 +3,7 @@
 *.dbg.sh
 *.bac
 *.bac/
+*.patch
 
 Caddyfile
 *.caddy
