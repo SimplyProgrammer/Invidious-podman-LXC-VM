@@ -901,3 +901,26 @@ func TestAdaptiveProxyRaceLoserCompletionDoesNotCancelWinnerStream(t *testing.T)
 		t.Fatalf("winner response was truncated: status=%d body=%q", rr.Code, rr.Body.String())
 	}
 }
+
+func TestMetricsFailureDiagnostics(t *testing.T) {
+	m := newMetricsCollector([]BackendConfig{{Name: "one", URL: "http://one"}})
+	m.recordFailure("one", 10*time.Millisecond, 0, false)
+	m.setFailureDiagnostic("one", -1, "connection reset")
+	items, _ := m.Snapshot()
+	if len(items) != 1 || items[0].LastFailureCode != -1 || items[0].LastFailureResponse != "connection reset" {
+		t.Fatalf("unexpected transport failure diagnostics: %+v", items)
+	}
+
+	m.recordFailure("one", 10*time.Millisecond, 0, false)
+	m.setFailureDiagnostic("one", 503, "service unavailable")
+	items, _ = m.Snapshot()
+	if items[0].LastFailureCode != 503 || items[0].LastFailureResponse != "service unavailable" {
+		t.Fatalf("unexpected HTTP failure diagnostics: %+v", items[0])
+	}
+
+	m.recordSuccess("one", 10*time.Millisecond, 0, false)
+	items, _ = m.Snapshot()
+	if items[0].LastFailureCode != 503 || items[0].LastFailureResponse != "service unavailable" {
+		t.Fatalf("success unexpectedly cleared failure diagnostics: %+v", items[0])
+	}
+}

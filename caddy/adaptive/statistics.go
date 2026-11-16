@@ -31,6 +31,8 @@ type BackendMetrics struct {
 	AverageThroughputBytesSec float64   `json:"average_throughput_bytes_sec"`
 	LastSuccess               time.Time `json:"last_success,omitempty"`
 	LastFailure               time.Time `json:"last_failure,omitempty"`
+	LastFailureCode           int       `json:"last_failure_code"`
+	LastFailureResponse       string    `json:"last_failure_response"`
 }
 
 type backendMetricState struct {
@@ -43,6 +45,8 @@ type backendMetricState struct {
 	lastBytes                                                                                         uint64
 	lastThroughput                                                                                    float64
 	lastSuccess, lastFailure                                                                          time.Time
+	lastFailureCode                                                                                   int
+	lastFailureResponse                                                                               string
 }
 
 // MetricsCollector is safe for concurrent request handlers. Logical request
@@ -176,6 +180,32 @@ func (m *MetricsCollector) recordCompletion(name string, duration, ttfb, transfe
 		b.recentTTFB = append([]time.Duration(nil), b.recentTTFB[len(b.recentTTFB)-recentDurationLimit:]...)
 	}
 }
+
+// setFailureCode changes only the code, preserving any body captured while the response was read.
+func (m *MetricsCollector) setFailureCode(name string, code int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if b := m.backends[name]; b != nil {
+		b.lastFailureCode = code
+	}
+}
+
+// setFailureDiagnostic updates the details associated with the latest backend failure.
+func (m *MetricsCollector) setFailureDiagnostic(name string, code int, response string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if b := m.backends[name]; b != nil {
+		b.lastFailureCode = code
+		b.lastFailureResponse = response
+	}
+}
+
 func avgDuration(ds []time.Duration) time.Duration {
 	var total time.Duration
 	for _, d := range ds {
@@ -205,7 +235,7 @@ func (m *MetricsCollector) Snapshot() ([]BackendMetrics, map[string]uint64) {
 		if b.totalTransfer > 0 {
 			throughput = float64(b.bytesTransferred) / b.totalTransfer.Seconds()
 		}
-		out = append(out, BackendMetrics{Name: b.name, URL: b.url, Requests: b.requests, Successes: b.successes, Failures: b.failures, Retries: b.retries, ClientCancellations: b.cancellations, SlowResponses: b.slowResponses, BytesTransferred: b.bytesTransferred, AverageDuration: avg.String(), RecentAverageDuration: avgDuration(b.recentDurations).String(), LastDuration: b.lastDuration.String(), LastBytes: b.lastBytes, LastThroughputBytesSec: b.lastThroughput, AverageTTFB: avgTTFB.String(), RecentAverageTTFB: avgDuration(b.recentTTFB).String(), LastTTFB: b.lastTTFB.String(), LastTransferDuration: b.lastTransfer.String(), AverageThroughputBytesSec: throughput, LastSuccess: b.lastSuccess, LastFailure: b.lastFailure})
+		out = append(out, BackendMetrics{Name: b.name, URL: b.url, Requests: b.requests, Successes: b.successes, Failures: b.failures, Retries: b.retries, ClientCancellations: b.cancellations, SlowResponses: b.slowResponses, BytesTransferred: b.bytesTransferred, AverageDuration: avg.String(), RecentAverageDuration: avgDuration(b.recentDurations).String(), LastDuration: b.lastDuration.String(), LastBytes: b.lastBytes, LastThroughputBytesSec: b.lastThroughput, AverageTTFB: avgTTFB.String(), RecentAverageTTFB: avgDuration(b.recentTTFB).String(), LastTTFB: b.lastTTFB.String(), LastTransferDuration: b.lastTransfer.String(), AverageThroughputBytesSec: throughput, LastSuccess: b.lastSuccess, LastFailure: b.lastFailure, LastFailureCode: b.lastFailureCode, LastFailureResponse: b.lastFailureResponse})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	g := map[string]uint64{"requests": m.requests, "attempts": m.attempts, "retries": m.retries, "exhausted_requests": m.exhausted, "slow": m.slow, "bytes": m.bytes, "in_progress": m.active}

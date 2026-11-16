@@ -17,7 +17,6 @@ type raceResult struct {
 	cancel   context.CancelFunc
 }
 
-
 type raceActive struct {
 	backend  BackendSnapshot
 	started  time.Time
@@ -103,7 +102,7 @@ func (h *Handler) serveRaced(w http.ResponseWriter, r *http.Request, maxAttempts
 			return
 		}
 		if !saved.scored {
-			h.metrics.recordCompletion(saved.backend.Name, saved.ttfb, saved.ttfb, 0, 0, false, false)
+			h.recordHTTPBackendFailure(saved.backend.Name, saved.ttfb, 0, false, saved.resp.StatusCode, saved.ttfb, 0)
 			saved.scored = true
 		}
 		closeAndDrain(saved.resp.Body)
@@ -224,6 +223,8 @@ func (h *Handler) serveRaced(w http.ResponseWriter, r *http.Request, maxAttempts
 				ttfb = 0
 			}
 			if h.shouldRetryStatus(result.resp.StatusCode) {
+				result.resp.Body = newFailureCaptureBody(result.resp.Body, func(body string) { h.metrics.setFailureDiagnostic(result.backend.Name, result.resp.StatusCode, body) })
+				h.metrics.setFailureDiagnostic(result.backend.Name, result.resp.StatusCode, "")
 				h.penalize(result.backend.Name, *h.ErrorPenalty)
 				if h.breaker != nil {
 					h.breaker.RecordFailure(result.backend.Name, time.Now())
@@ -233,7 +234,7 @@ func (h *Handler) serveRaced(w http.ResponseWriter, r *http.Request, maxAttempts
 				}
 				saved = &raceSavedResponse{resp: result.resp, backend: result.backend, started: result.started, ttfb: ttfb, cancel: result.cancel}
 				if launchNext(result.backend.Name) {
-					h.metrics.recordCompletion(result.backend.Name, ttfb, ttfb, 0, 0, false, false)
+					h.recordHTTPBackendFailure(result.backend.Name, ttfb, 0, false, result.resp.StatusCode, ttfb, 0)
 					saved.scored = true
 				}
 				continue
@@ -275,7 +276,7 @@ func (h *Handler) serveRaced(w http.ResponseWriter, r *http.Request, maxAttempts
 				}
 				h.penalize(saved.backend.Name, penalty)
 			}
-			h.metrics.recordCompletion(saved.backend.Name, duration, saved.ttfb, transfer, uint64(bytesRead), slow, false)
+			h.recordHTTPBackendFailure(saved.backend.Name, duration, uint64(bytesRead), slow, saved.resp.StatusCode, saved.ttfb, transfer)
 		}
 		saved = nil
 		if copyErr != nil && r.Context().Err() == nil && !isClientCancellation(copyErr) {
@@ -305,7 +306,7 @@ func (h *Handler) serveRaced(w http.ResponseWriter, r *http.Request, maxAttempts
 				}
 				h.penalize(saved.backend.Name, penalty)
 			}
-			h.metrics.recordCompletion(saved.backend.Name, duration, saved.ttfb, transfer, uint64(bytesRead), slow, false)
+			h.recordHTTPBackendFailure(saved.backend.Name, duration, uint64(bytesRead), slow, saved.resp.StatusCode, saved.ttfb, transfer)
 		}
 		saved = nil
 	}
@@ -335,11 +336,7 @@ func (h *Handler) writeRaceWinner(w http.ResponseWriter, r *http.Request, result
 	}
 	if copyErr != nil {
 		if tracked.writeErr == nil && r.Context().Err() == nil && !isClientCancellation(copyErr) {
-			h.penalize(result.backend.Name, *h.ErrorPenalty)
-			h.metrics.recordCompletion(result.backend.Name, duration, ttfb, transfer, uint64(bytesWritten), false, false)
-			if h.breaker != nil {
-				h.breaker.RecordFailure(result.backend.Name, time.Now())
-			}
+			h.recordBackendFailure(result.backend.Name, duration, uint64(bytesWritten), false)
 			*outcome = "interrupted_transfer"
 			return fmt.Errorf("streaming response from backend %q: %w", result.backend.Name, copyErr)
 		}
@@ -356,7 +353,7 @@ func (h *Handler) writeRaceWinner(w http.ResponseWriter, r *http.Request, result
 		h.penalize(result.backend.Name, penalty)
 	}
 	if h.shouldRetryStatus(resp.StatusCode) {
-		h.metrics.recordCompletion(result.backend.Name, duration, ttfb, transfer, uint64(bytesWritten), slow, false)
+		h.recordHTTPBackendFailure(result.backend.Name, duration, uint64(bytesWritten), slow, resp.StatusCode, ttfb, transfer)
 		if h.breaker != nil {
 			h.breaker.RecordFailure(result.backend.Name, time.Now())
 		}
@@ -402,10 +399,12 @@ func (h *Handler) scoreRaceLoser(result raceResult) {
 		ttfb = 0
 	}
 	if h.shouldRetryStatus(resp.StatusCode) {
+		resp.Body = newFailureCaptureBody(resp.Body, func(body string) { h.metrics.setFailureDiagnostic(result.backend.Name, resp.StatusCode, body) })
+		h.metrics.setFailureDiagnostic(result.backend.Name, resp.StatusCode, "")
 		h.penalize(result.backend.Name, *h.ErrorPenalty)
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
-		h.metrics.recordCompletion(result.backend.Name, ttfb, ttfb, 0, 0, false, false)
+		h.recordHTTPBackendFailure(result.backend.Name, ttfb, 0, false, resp.StatusCode, ttfb, 0)
 		if h.breaker != nil {
 			h.breaker.RecordFailure(result.backend.Name, time.Now())
 		}

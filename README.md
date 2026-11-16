@@ -56,6 +56,10 @@ Show caddy adaptive_proxy `/_adaptive/status` when enabled (need format):
 podman exec "$(podman ps -q --filter name=caddy | head -n1)" curl -sk --resolve <YOUR_INVIDIOUS_DOMAIN>:443:127.0.0.1 https://<YOUR_INVIDIOUS_DOMAIN>/_adaptive/status
 ```
 
+If you cant access an instance after restarting it, try running the commands `cleanup-netavark-hostport.dbg.sh` and `cleanup-netavark-hostport.dbg.sh --apply`.
+It will remove any duplicate `nft` rules. This can occur as a side effect of using the `podman-compose` tool.
+This script dbg is included by default due to its size.
+
 # Notice
 This solution was intended for Proxmox VMs and LXC, but theoretically, it should work with any platform that can virtualize Debian with basic networking included.
 In theory, this could also work on non Debian based host OSes with slight modifications to the setup script. However, known conditions that are non-negotiable are `systemd`, virtualization + podman support, and the OS cannot be too minimalistic. For example, I have already attempted Alpine port to no avail...\

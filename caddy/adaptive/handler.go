@@ -256,6 +256,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 		responseReceived := time.Now()
 		ttfb := responseReceived.Sub(started)
 		if h.shouldRetryStatus(resp.StatusCode) {
+			resp.Body = newFailureCaptureBody(resp.Body, func(body string) { h.metrics.setFailureDiagnostic(backend.Name, resp.StatusCode, body) })
+			h.metrics.setFailureDiagnostic(backend.Name, resp.StatusCode, "")
 			lastErr = fmt.Errorf("upstream %s returned retryable HTTP status %d", backend.Name, resp.StatusCode)
 			h.penalize(backend.Name, *h.ErrorPenalty)
 			canRetry := attempt+1 < maxAttempts
@@ -264,7 +266,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 				canRetry = len(autoCandidates) > 0 && attempt+1 < maxAttempts
 			}
 			if canRetry {
-				h.metrics.recordCompletion(backend.Name, ttfb, ttfb, 0, 0, false, false)
+				h.recordHTTPBackendFailure(backend.Name, ttfb, 0, false, resp.StatusCode, ttfb, 0)
 				if h.breaker != nil {
 					h.breaker.RecordFailure(backend.Name, time.Now())
 				}
@@ -298,7 +300,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 					}
 					h.penalize(backend.Name, latencyPenalty)
 				}
-				h.metrics.recordCompletion(backend.Name, duration, ttfb, transferDuration, uint64(bytesRead), slow, false)
+				h.recordHTTPBackendFailure(backend.Name, duration, uint64(bytesRead), slow, resp.StatusCode, ttfb, transferDuration)
 				if h.breaker != nil {
 					h.breaker.RecordFailure(backend.Name, time.Now())
 				}
@@ -331,9 +333,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 			// corrupt the response. A downstream write failure/client disconnect
 			// is not evidence that the selected upstream is unhealthy.
 			if trackedWriter.writeErr == nil && r.Context().Err() == nil && !isClientCancellation(copyErr) {
-				h.penalize(backend.Name, *h.ErrorPenalty)
-				h.metrics.recordCompletion(backend.Name, duration, ttfb, transferDuration, uint64(bytesWritten), false, false)
-				if h.breaker != nil {
+				if statusFailure {
+					h.recordHTTPBackendFailure(backend.Name, duration, uint64(bytesWritten), false, resp.StatusCode, ttfb, transferDuration)
+				} else {
+					h.recordBackendFailure(backend.Name, duration, uint64(bytesWritten), false)
+				}
+				if statusFailure && h.breaker != nil {
 					h.breaker.RecordFailure(backend.Name, time.Now())
 				}
 				outcome = "interrupted_transfer"
@@ -355,7 +360,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.
 		if statusFailure {
 			// The response was delivered, but its status is still a configured
 			// backend failure.
-			h.metrics.recordCompletion(backend.Name, duration, ttfb, transferDuration, uint64(bytesWritten), slow, false)
+			h.recordHTTPBackendFailure(backend.Name, duration, uint64(bytesWritten), slow, resp.StatusCode, ttfb, transferDuration)
 			if h.breaker != nil {
 				h.breaker.RecordFailure(backend.Name, time.Now())
 			}
@@ -444,9 +449,22 @@ func (h *Handler) autoRetryCandidates(excluded map[string]struct{}) []BackendSna
 func (h *Handler) recordBackendFailure(name string, duration time.Duration, bytes uint64, slow bool) {
 	h.penalize(name, *h.ErrorPenalty)
 	h.metrics.recordFailure(name, duration, bytes, slow)
+	h.metrics.setFailureDiagnostic(name, -1, "")
 	if h.breaker != nil {
 		h.breaker.RecordFailure(name, time.Now())
 	}
+}
+
+func (h *Handler) recordHTTPBackendFailure(name string, duration time.Duration, bytes uint64, slow bool, code int, timing ...time.Duration) {
+	var ttfb, transfer time.Duration
+	if len(timing) > 0 {
+		ttfb = timing[0]
+	}
+	if len(timing) > 1 {
+		transfer = timing[1]
+	}
+	h.metrics.recordCompletion(name, duration, ttfb, transfer, bytes, slow, false)
+	h.metrics.setFailureCode(name, code)
 }
 
 func (h *Handler) serveStatistics(w http.ResponseWriter, r *http.Request) {
